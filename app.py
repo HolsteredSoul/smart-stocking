@@ -349,13 +349,51 @@ def screening_page(data_service: DataService):
     
     # Ticker input
     st.subheader("Stock Selection")
-    
+
+    # ---- Company name search (backed by bundled S&P 500 / extended universe CSV) ----
+    @st.cache_data
+    def _load_universe() -> "pd.DataFrame":
+        import os, pathlib
+        csv_path = pathlib.Path(__file__).parent / "data" / "sp500_tickers.csv"
+        if csv_path.exists():
+            return pd.read_csv(csv_path)
+        return pd.DataFrame(columns=["Symbol", "Name", "Sector"])
+
+    universe_df = _load_universe()
+    if not universe_df.empty:
+        with st.expander("🔍 Search by company name (don't know the ticker?)"):
+            # Build display labels "Apple Inc. (AAPL)"
+            universe_df["_label"] = universe_df["Name"] + " (" + universe_df["Symbol"] + ")"
+            chosen_labels = st.multiselect(
+                "Type a company name to search:",
+                options=universe_df["_label"].tolist(),
+                placeholder="e.g. Apple, Microsoft, Johnson & Johnson…",
+            )
+            if chosen_labels:
+                label_to_sym = dict(zip(universe_df["_label"], universe_df["Symbol"]))
+                found_tickers = [label_to_sym[lbl] for lbl in chosen_labels]
+                st.caption(
+                    "Selected: " + ", ".join(found_tickers)
+                    + " — click **Add to ticker list** to use them."
+                )
+                if st.button("Add to ticker list"):
+                    existing = [t.strip().upper() for t in
+                                st.session_state.get("_ticker_text", "").split(",") if t.strip()]
+                    merged = list(dict.fromkeys(existing + found_tickers))  # dedup, preserve order
+                    st.session_state["_ticker_text"] = ", ".join(merged)
+                    st.rerun()
+
     col1, col2 = st.columns([2, 1])
-    
+
+    # Resolve ticker text: prefer session state override from the search above
+    _ticker_default = st.session_state.pop("_ticker_text", None)
+    if _ticker_default is None:
+        _ticker_default = ", ".join(st.session_state.selected_tickers)
+
     with col1:
         tickers_input = st.text_area(
             "Enter stock tickers (comma-separated)",
-            value=", ".join(st.session_state.selected_tickers),
+            value=_ticker_default,
             height=100,
             help="Enter stock symbols separated by commas (e.g., AAPL, MSFT, GOOGL). Due to rate limits, fewer stocks are recommended."
         )
