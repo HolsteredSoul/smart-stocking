@@ -16,8 +16,57 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 import numpy as np
 import pandas as pd
-import streamlit as st
-import yfinance as yf
+
+try:
+    import yfinance as yf
+except ImportError:  # pragma: no cover
+    yf = None  # type: ignore[assignment]
+
+# Streamlit is optional — the scoring / data-fetching logic works without it.
+# When running under pytest or as a plain script the stub below is used so that
+# @st.cache_data decorators and UI helpers become harmless no-ops.
+try:
+    import streamlit as st
+except ImportError:  # pragma: no cover
+    class _StubSecrets:  # noqa: N801
+        def get(self, key, default=""):
+            return default
+
+    class _StubSt:  # noqa: N801
+        secrets = _StubSecrets()
+
+        @staticmethod
+        def cache_data(ttl=None, **kwargs):
+            def _decorator(fn):
+                return fn
+            return _decorator
+
+        @staticmethod
+        def empty():
+            class _P:
+                def text(self, msg): pass
+                def markdown(self, msg): pass
+            return _P()
+
+        @staticmethod
+        def progress(val):
+            class _Bar:
+                def progress(self, val, text=""): pass
+            return _Bar()
+
+        @staticmethod
+        def info(msg): pass
+
+        @staticmethod
+        def warning(msg): pass
+
+        @staticmethod
+        def error(msg): pass
+
+        @staticmethod
+        def success(msg): pass
+
+    st = _StubSt()  # type: ignore[assignment]
 
 # Canonical mapping: strategy display name -> score column name
 # Must stay in sync with the copy in app.py

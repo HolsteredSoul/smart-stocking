@@ -849,10 +849,18 @@ def create_demo_data(tickers: List[str]) -> pd.DataFrame:
             'volatility': np.random.uniform(0.15, 0.45)
         }
         
-        # Calculate composite score using all 6 strategy score columns
-        scores = [data['momentum_score'], data['value_score'], data['growth_score'],
-                  data['quality_score'], data['income_score'], data['volatility_score']]
-        data['composite_score'] = np.mean(scores)
+        # Calculate composite score respecting selected strategies and custom weights
+        selected = st.session_state.get('selected_strategies', list(STRATEGY_SCORE_COLUMNS.keys()))
+        w = st.session_state.get('custom_weights', {})
+        score_cols = {s: STRATEGY_SCORE_COLUMNS[s] for s in selected if s in STRATEGY_SCORE_COLUMNS}
+        if w:
+            total_w = sum(w.get(s, 1.0) for s in score_cols) or 1.0
+            data['composite_score'] = sum(
+                data[col] * w.get(s, 1.0) / total_w
+                for s, col in score_cols.items()
+            )
+        else:
+            data['composite_score'] = np.mean([data[col] for col in score_cols.values()])
         
         demo_data.append(data)
     
