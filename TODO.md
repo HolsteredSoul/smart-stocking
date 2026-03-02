@@ -51,9 +51,9 @@ These tasks make the scores more accurate and meaningful.
 
 - [x] **Add P/S ratio to Value scoring** — Current value scoring uses P/E, P/B, and EV/EBITDA. P/S (Price-to-Sales) ratio is a key metric especially for companies with low or negative earnings. P/S < 2 is generally cheap; P/S > 10 is expensive. Add it as a 4th component. (`services/data_service.py:calculate_value_scores()`)
 
-- [ ] **Add sector-relative value thresholds** — The current value thresholds are absolute (e.g., P/E < 15 = max points). A P/E of 25 is cheap for software but expensive for retail. Normalise thresholds by sector median to make scoring relative to peers. Sector data is already present in fundamentals. (`services/data_service.py:calculate_value_scores()`)
+- [x] **Add sector-relative value thresholds** — The current value thresholds are absolute (e.g., P/E < 15 = max points). A P/E of 25 is cheap for software but expensive for retail. Normalise thresholds by sector median to make scoring relative to peers. Sector data is already present in fundamentals. (`services/data_service.py:calculate_value_scores()`)
 
-- [ ] **Replace revenue growth dividend proxy in Income scoring with actual dividend history** — Current income scoring uses revenue growth as a proxy for dividend sustainability. `yfinance` provides the actual `dividends` time series — use it to check dividend consistency (paid every quarter) and dividend growth direction (increasing year-over-year). (`services/data_service.py:calculate_income_scores()`)
+- [x] **Replace revenue growth dividend proxy in Income scoring with actual dividend history** — Current income scoring uses revenue growth as a proxy for dividend sustainability. `yfinance` provides the actual `dividends` time series — use it to check dividend consistency (paid every quarter) and dividend growth direction (increasing year-over-year). (`services/data_service.py:calculate_income_scores()`)
 
 - [x] **Add Piotroski F-Score to Quality scoring** *(simplified — 3 of 9 signals)* — Implemented a simplified 3-signal version using available data: positive ROE (profitability), D/E < 1.0 (leverage), current ratio > 1.0 (liquidity). Full 9-signal version requires additional historical data not yet fetched. (`services/data_service.py:calculate_quality_scores()`)
 
@@ -85,7 +85,7 @@ These tasks make the scores more accurate and meaningful.
 
 - [x] **Add `.streamlit/config.toml`** — Set explicit defaults for theme (light/dark), server port, and `maxUploadSize` instead of relying on Streamlit defaults. Prevents surprises across different deployment environments.
 
-- [ ] **Add `Dockerfile` and `docker-compose.yml`** — `Dockerfile` added. `docker-compose.yml` not yet created.
+- [x] **Add `Dockerfile` and `docker-compose.yml`** — Both added. `docker-compose.yml` mounts secrets read-only; `docker compose up` starts the app.
 
 - [x] **Add integration test documentation to README** — The `TestDataService` class is silently skipped unless `RUN_INTEGRATION_TESTS=true` is set. Document this in `README.md` so contributors know how to run the full test suite.
 
@@ -99,20 +99,20 @@ These tasks make the scores more accurate and meaningful.
 
 ### Technical — Scoring & Data
 
-- [ ] **Add sector-relative value thresholds** *(carries over from High section above)* — A P/E of 25 is cheap for software but expensive for retail. After fetching fundamentals, compute sector medians for P/E, P/B, P/S, EV/EBITDA across the screened set, then score each stock relative to its sector peers rather than against absolute cut-offs. (`services/data_service.py:calculate_value_scores()`)
+- [x] **Add sector-relative value thresholds** *(carries over from High section above)* — A P/E of 25 is cheap for software but expensive for retail. After fetching fundamentals, compute sector medians for P/E, P/B, P/S, EV/EBITDA across the screened set, then score each stock relative to its sector peers rather than against absolute cut-offs. (`services/data_service.py:calculate_value_scores()`)
 
-- [ ] **Replace revenue-growth dividend proxy with actual dividend history** *(carries over from High section above)* — Fetch the `yfinance` `Ticker.dividends` Series for each ticker. Use it to check: (1) paid every quarter for the last 2 years, (2) year-over-year dividend growth direction. Bump sustainable/growing payers, penalise sporadic ones. (`services/data_service.py:calculate_income_scores()` + data-fetch pipeline)
+- [x] **Replace revenue-growth dividend proxy with actual dividend history** *(carries over from High section above)* — Fetch the `yfinance` `Ticker.dividends` Series for each ticker. Use it to check: (1) paid every quarter for the last 2 years, (2) year-over-year dividend growth direction. Bump sustainable/growing payers, penalise sporadic ones. (`services/data_service.py:calculate_income_scores()` + data-fetch pipeline)
 
-- [ ] **Upgrade to full 9-signal Piotroski F-Score** — Current implementation covers 3 signals (ROE, D/E, current ratio). The remaining 6 signals — cash flow from operations positive, ROA improving YoY, accruals (CFO > net income), leverage trend, gross margin trend, asset turnover trend — require two years of income statement + cash flow data. Fetch them via `yfinance Ticker.financials` / `Ticker.cashflow` and integrate. (`services/data_service.py:calculate_quality_scores()`)
+- [x] **Upgrade to full 9-signal Piotroski F-Score** — All 9 signals implemented. Signals 4-9 (CFO positive, ROA improving YoY, accruals, leverage trend, gross margin trend, asset turnover trend) fetched via `yfinance Ticker.financials` / `Ticker.cashflow`. Max bonus 27 pts, capped at 100. (`services/data_service.py:calculate_quality_scores()`)
 
-- [ ] **Add transaction costs and slippage to the backtest engine** — `run_backtest()` currently assumes zero cost. Add a configurable round-trip cost parameter (default 0.1% per trade) applied at portfolio formation. Also add a liquidity filter: exclude stocks with average daily dollar volume below a threshold (e.g. <$1M) to avoid unrealistic fills. (`services/data_service.py:run_backtest()`)
+- [x] **Add transaction costs and slippage to the backtest engine** — `run_backtest()` now accepts `cost_pct` (default 0.1%) and `min_avg_daily_volume` (default $1M) parameters. Liquidity filter excludes thinly-traded stocks; cost deducted at portfolio formation. Both params are exposed in the backtest UI. (`services/data_service.py:run_backtest()`)
 
 ### UX — Discovery & Accessibility
 
-- [ ] **Add a stock universe browser so users don't need to know ticker symbols** — Currently users must type tickers manually or pick a preset list. Add a searchable dropdown backed by a static list of S&P 500 (or Russell 2000) constituents — user types a company name and gets the ticker. A CSV of index constituents is small (~10 KB) and can ship with the repo. (`app.py`, ticker input section; new `data/sp500_tickers.csv`)
+- [x] **Add a stock universe browser so users don't need to know ticker symbols** — Added a collapsible "Search by company name" expander backed by `data/sp500_tickers.csv` (~500 stocks). User types a company name, picks from the list, and tickers are appended to the manual entry area. (`app.py`, ticker input section; `data/sp500_tickers.csv`)
 
-- [ ] **Add `docker-compose.yml`** — `Dockerfile` is present. A `docker-compose.yml` lets users start the whole app with a single `docker compose up` without needing to remember the `docker run` flags. Two-service version: `app` (Streamlit) + optional `nginx` reverse proxy for local HTTPS. (`docker-compose.yml` in root)
+- [x] **Add `docker-compose.yml`** — Added. Single `app` service exposing port 8501, mounts `.streamlit/secrets.toml` read-only. `docker compose up` is all that's needed. (`docker-compose.yml` in root)
 
 ### Code Quality
 
-- [ ] **Deduplicate `STRATEGY_SCORE_COLUMNS` between `app.py` and `data_service.py`** — The canonical mapping (`Momentum → momentum_score`, etc.) is defined in both files and must stay in sync manually. Move it to `models/constants.py` and import from there in both files. Low risk, one-line change in two files. (`models/constants.py`, `app.py`, `services/data_service.py`)
+- [x] **Deduplicate `STRATEGY_SCORE_COLUMNS` between `app.py` and `data_service.py`** — Moved to `models/constants.py`; both files now import from there. (`models/constants.py`, `app.py`, `services/data_service.py`)
