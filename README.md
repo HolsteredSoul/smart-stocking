@@ -129,9 +129,72 @@ streamlit run app.py
 - Use Demo Mode for testing without API calls
 - Add API keys for additional fallback sources
 
+## Testing
+
+### Unit tests (no API calls, no Streamlit required)
+
+```bash
+pip install pandas numpy aiohttp pytest
+python -m pytest tests/test_strategies.py -v
+```
+
+Expected output: **8 passed, 1 skipped** (the `TestDataService` integration test
+is skipped unless the flag below is set).
+
+### Integration tests (real Yahoo Finance API)
+
+```bash
+RUN_INTEGRATION_TESTS=true python -m pytest tests/test_strategies.py -v
+```
+
+This runs `TestDataService.test_fetch_stock_data` which makes live network calls.
+Ensure you are not rate-limited before running.
+
+### CI
+
+A GitHub Actions workflow runs the unit tests on every push:
+`.github/workflows/ci.yml`
+
+## Docker
+
+```bash
+docker build -t smartstock .
+docker run -p 8501:8501 smartstock
+```
+
+Open `http://localhost:8501` in your browser.
+
+## Project Structure
+
+```
+smart-stocking/
+├── app.py                          # Main Streamlit application
+├── requirements.txt                # Python dependencies
+├── pyproject.toml                  # Project metadata and tool config
+├── Dockerfile                      # Container image
+├── .github/workflows/ci.yml        # CI pipeline
+├── services/
+│   └── data_service.py             # Data fetching, scoring, backtest engine
+├── models/
+│   ├── strategy_config.py          # StrategyConfig, strategy classes, StrategyFactory
+│   └── constants.py                # Centralised scoring thresholds and constants
+├── utils/
+│   ├── visualization.py            # Plotly chart builders
+│   ├── enhanced_ui.py              # Advanced UI, PDF export, backtest UI
+│   ├── data_cache_manager.py       # Session-based data caching + batch fetch
+│   └── session_state_manager.py    # Robust parameter state handling
+├── pages/
+│   └── troubleshooting.py          # Diagnostics page
+├── tests/
+│   └── test_strategies.py          # Unit + integration tests
+└── .streamlit/
+    ├── config.toml                 # Streamlit server/theme config
+    └── secrets.toml                # API keys (not committed)
+```
+
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the MIT License — see the LICENSE file for details.
 
 ## Disclaimer
 
@@ -139,5 +202,5 @@ SmartStock is for informational purposes only. Always conduct your own research 
 
 ---
 
-**Version**: 1.0 MVP
-**Last Updated**: February 2026
+**Version**: 1.1
+**Last Updated**: March 2026

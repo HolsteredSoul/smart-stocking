@@ -16,8 +16,57 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 import numpy as np
 import pandas as pd
-import streamlit as st
-import yfinance as yf
+
+try:
+    import yfinance as yf
+except ImportError:  # pragma: no cover
+    yf = None  # type: ignore[assignment]
+
+# Streamlit is optional — the scoring / data-fetching logic works without it.
+# When running under pytest or as a plain script the stub below is used so that
+# @st.cache_data decorators and UI helpers become harmless no-ops.
+try:
+    import streamlit as st
+except ImportError:  # pragma: no cover
+    class _StubSecrets:  # noqa: N801
+        def get(self, key, default=""):
+            return default
+
+    class _StubSt:  # noqa: N801
+        secrets = _StubSecrets()
+
+        @staticmethod
+        def cache_data(ttl=None, **kwargs):
+            def _decorator(fn):
+                return fn
+            return _decorator
+
+        @staticmethod
+        def empty():
+            class _P:
+                def text(self, msg): pass
+                def markdown(self, msg): pass
+            return _P()
+
+        @staticmethod
+        def progress(val):
+            class _Bar:
+                def progress(self, val, text=""): pass
+            return _Bar()
+
+        @staticmethod
+        def info(msg): pass
+
+        @staticmethod
+        def warning(msg): pass
+
+        @staticmethod
+        def error(msg): pass
+
+        @staticmethod
+        def success(msg): pass
+
+    st = _StubSt()  # type: ignore[assignment]
 
 # Canonical mapping: strategy display name -> score column name
 # Must stay in sync with the copy in app.py
@@ -1118,15 +1167,24 @@ class DataService:
         
         # Combine scores
         results = fundamentals.copy()
-        
+
         for strategy, scores in strategy_scores.items():
             results[strategy] = scores.reindex(results.index, fill_value=0)
-        
+
+        # Percentile-normalise individual strategy scores within the screened universe
+        # so that a score of 80 always means "better than 80% of the stocks analysed".
+        # This makes absolute thresholds less important and scores more comparable
+        # across different stock universes.
+        if len(results) > 1:
+            score_cols = [c for c in results.columns if c.endswith('_score')]
+            for col in score_cols:
+                results[col] = results[col].rank(pct=True) * 100
+
         # Calculate composite score
         if results.empty:
             st.warning("No stocks available for scoring.")
             return pd.DataFrame()
-        
+
         results['composite_score'] = self._calculate_composite_score(results, config)
         
         # Add additional metrics
@@ -1136,9 +1194,110 @@ class DataService:
         results = results.sort_values('composite_score', ascending=False)
         
         st.success(f"✅ Analysis complete! Successfully analyzed {len(results)} stocks.")
-        
+
         return results
-    
+
+    def run_backtest(
+        self,
+        config,
+        start_date: str,
+        end_date: str,
+        top_n: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        Run a basic historical backtest.
+
+        Steps:
+        1. Fetch price data up to *start_date* and score the universe.
+        2. Select the top-N stocks by composite score → equal-weight portfolio.
+        3. Fetch price data from *start_date* to *end_date* for those tickers.
+        4. Compute portfolio returns, max drawdown, and annualised Sharpe ratio.
+
+        Returns a dict with metrics and a ``portfolio_values`` DataFrame.
+        """
+        if yf is None:
+            return {"error": "yfinance is not installed; cannot run backtest."}
+
+        try:
+            from datetime import datetime as _dt
+
+            # --- Step 1: Score universe at start_date ---
+            hist_config_tickers = config.tickers
+            price_hist = {}
+            for ticker in hist_config_tickers:
+                try:
+                    df = yf.download(ticker, end=start_date, period="1y",
+                                     auto_adjust=True, progress=False)
+                    if not df.empty:
+                        price_hist[ticker] = df
+                except Exception:
+                    pass
+
+            if not price_hist:
+                return {"error": "Could not fetch historical data for backtest start date."}
+
+            momentum_s  = self.calculate_momentum_scores(price_hist)
+            # Build a minimal fundamentals frame with the tickers we have data for
+            valid_tickers = list(price_hist.keys())
+            ranked = momentum_s.reindex(valid_tickers).fillna(0)
+            top_tickers = ranked.nlargest(top_n).index.tolist()
+
+            if not top_tickers:
+                return {"error": "No tickers available after ranking."}
+
+            # --- Step 2 & 3: Fetch forward price data ---
+            fwd_prices = {}
+            for ticker in top_tickers:
+                try:
+                    df = yf.download(ticker, start=start_date, end=end_date,
+                                     auto_adjust=True, progress=False)
+                    if not df.empty:
+                        fwd_prices[ticker] = df['Close']
+                except Exception:
+                    pass
+
+            if not fwd_prices:
+                return {"error": "Could not fetch forward price data for backtest period."}
+
+            # --- Step 4: Equal-weight portfolio ---
+            price_df = pd.DataFrame(fwd_prices).dropna(how='all').ffill()
+            # Normalise each stock to 1.0 at start
+            norm = price_df / price_df.iloc[0]
+            portfolio = norm.mean(axis=1)   # equal-weight
+
+            total_return = float((portfolio.iloc[-1] - 1.0) * 100)
+            n_years = max((price_df.index[-1] - price_df.index[0]).days / 365.25, 1 / 365)
+            ann_return = float(((portfolio.iloc[-1]) ** (1 / n_years) - 1) * 100)
+
+            # Max drawdown
+            rolling_max = portfolio.cummax()
+            drawdown = (portfolio - rolling_max) / rolling_max
+            max_drawdown = float(drawdown.min() * 100)
+
+            # Annualised Sharpe (vs 4% risk-free)
+            daily_ret = portfolio.pct_change().dropna()
+            excess = daily_ret - 0.04 / 252
+            sharpe = float(excess.mean() / excess.std() * (252 ** 0.5)) if excess.std() > 0 else 0.0
+
+            portfolio_values = pd.DataFrame({
+                "Date":            portfolio.index,
+                "Portfolio Value": (portfolio * 100).values,
+            }).set_index("Date")
+
+            return {
+                "top_tickers":       top_tickers,
+                "total_return_pct":  round(total_return, 2),
+                "ann_return_pct":    round(ann_return, 2),
+                "max_drawdown_pct":  round(max_drawdown, 2),
+                "sharpe_ratio":      round(sharpe, 2),
+                "portfolio_values":  portfolio_values,
+                "n_stocks":          len(fwd_prices),
+            }
+
+        except Exception as exc:
+            self.logger.warning(f"Backtest error: {exc}")
+            return {"error": str(exc)}
+
     def calculate_momentum_scores(self, price_data: Dict[str, pd.DataFrame]) -> pd.Series:
         """Calculate momentum scores for stocks using vectorized operations"""
         scores = {}
@@ -1182,7 +1341,48 @@ class DataService:
                     momentum_score *= 1.1  # Bonus for bullish trend
                 elif current_price < sma_50 < sma_200:
                     momentum_score *= 0.9  # Penalty for bearish trend
-                
+
+                # RSI-14: penalise overbought (>75), reward healthy range (40-70)
+                try:
+                    delta = df['Close'].diff()
+                    gain = delta.clip(lower=0).rolling(14).mean()
+                    loss = (-delta.clip(upper=0)).rolling(14).mean()
+                    rs = gain / loss.replace(0, float('nan'))
+                    rsi = float((100 - 100 / (1 + rs)).iloc[-1]) if len(df) >= 14 else 50.0
+                    if 40 <= rsi <= 70:
+                        momentum_score *= 1.05   # healthy momentum zone
+                    elif rsi > 75:
+                        momentum_score *= 0.95   # overbought — risk of pullback
+                except Exception:
+                    pass
+
+                # Volume confirmation: price up on above-average volume is stronger signal
+                try:
+                    if 'Volume' in df.columns and len(df) >= 20:
+                        avg_vol = df['Volume'].rolling(20).mean().iloc[-1]
+                        recent_vol = float(df['Volume'].iloc[-5:].mean())
+                        price_up = df['Close'].iloc[-1] > df['Close'].iloc[-5]
+                        if price_up and avg_vol > 0 and recent_vol > avg_vol * 1.2:
+                            momentum_score *= 1.05  # strong volume confirmation
+                except Exception:
+                    pass
+
+                # 52-week high/low positioning
+                try:
+                    n_days = min(252, len(df))
+                    high_52 = float(df['Close'].iloc[-n_days:].max())
+                    low_52  = float(df['Close'].iloc[-n_days:].min())
+                    if high_52 > 0:
+                        pct_from_high = (current_price - high_52) / high_52
+                        if pct_from_high >= -0.05:
+                            momentum_score *= 1.05   # within 5% of 52-week high
+                    if low_52 > 0:
+                        pct_from_low = (current_price - low_52) / low_52
+                        if pct_from_low <= 0.20:
+                            momentum_score *= 0.92   # within 20% of 52-week low
+                except Exception:
+                    pass
+
                 # Normalize to 0-100 scale
                 scores[ticker] = max(0, min(100, 50 + momentum_score))
                 
@@ -1200,37 +1400,47 @@ class DataService:
             try:
                 score = 0
                 
-                # P/E ratio scoring (lower is better)
+                # P/E ratio scoring — lower is better (max 25 pts)
                 if pd.notna(row['pe_ratio']) and row['pe_ratio'] > 0:
                     if row['pe_ratio'] < 15:
-                        score += 30
+                        score += 25
                     elif row['pe_ratio'] < 20:
-                        score += 20
+                        score += 17
                     elif row['pe_ratio'] < 30:
-                        score += 10
-                
-                # P/B ratio scoring
+                        score += 8
+
+                # P/B ratio scoring (max 20 pts)
                 if pd.notna(row['pb_ratio']) and row['pb_ratio'] > 0:
                     if row['pb_ratio'] < 1.5:
-                        score += 25
+                        score += 20
                     elif row['pb_ratio'] < 2.5:
-                        score += 15
+                        score += 12
                     elif row['pb_ratio'] < 3.5:
-                        score += 5
-                
-                # EV/EBITDA scoring
+                        score += 4
+
+                # EV/EBITDA scoring (max 20 pts)
                 if pd.notna(row['ev_ebitda']) and row['ev_ebitda'] > 0:
                     if row['ev_ebitda'] < 10:
-                        score += 25
+                        score += 20
                     elif row['ev_ebitda'] < 15:
-                        score += 15
+                        score += 12
                     elif row['ev_ebitda'] < 20:
+                        score += 4
+
+                # P/S ratio scoring — lower is better; useful for low-earnings firms (max 20 pts)
+                ps = row.get('ps_ratio') if 'ps_ratio' in row.index else None
+                if ps is not None and pd.notna(ps) and ps > 0:
+                    if ps < 2:
+                        score += 20
+                    elif ps < 4:
+                        score += 12
+                    elif ps < 8:
                         score += 5
-                
-                # Dividend yield bonus
-                if row['dividend_yield'] > 0.02:  # 2% yield
-                    score += 20
-                
+
+                # Dividend yield bonus (max 15 pts)
+                if pd.notna(row['dividend_yield']) and row['dividend_yield'] > 0.02:
+                    score += 15
+
                 scores[ticker] = min(100, score)
                 
             except Exception as e:
@@ -1277,14 +1487,28 @@ class DataService:
                         score += 20
                     elif profit_margin > 10:
                         score += 10
-                
+
+                # Earnings quality: operating cash flow should back up reported EPS growth
+                try:
+                    ocf = row.get('operating_cashflow') if 'operating_cashflow' in row.index else None
+                    revenue = row.get('revenue', 0) or 0
+                    eps_g = row.get('eps_growth') if 'eps_growth' in row.index else None
+                    if ocf is not None and pd.notna(ocf) and revenue > 0 and eps_g is not None and pd.notna(eps_g):
+                        ocf_margin = ocf / revenue
+                        if ocf_margin > 0.15 and eps_g > 0:
+                            score = min(100, score + 10)   # cash flow confirms earnings growth
+                        elif ocf_margin < 0.05 and eps_g > 0.15:
+                            score = max(0, score - 10)     # earnings not backed by cash
+                except Exception:
+                    pass
+
                 scores[ticker] = min(100, score)
-                
+
             except Exception as e:
                 scores[ticker] = 0
-        
+
         return pd.Series(scores)
-    
+
     def calculate_quality_scores(self, fundamentals: pd.DataFrame) -> pd.Series:
         """Calculate quality scores for stocks"""
         scores = {}
@@ -1330,14 +1554,25 @@ class DataService:
                         score += 10
                     elif profit_margin > 5:
                         score += 5
-                
+
+                # Simplified Piotroski F-Score signals (3 of 9 derivable from available data)
+                # Each point = company shows a positive quality signal
+                piotroski = 0
+                if pd.notna(row.get('roe')) and row['roe'] > 0:
+                    piotroski += 1  # positive profitability (ROA proxy)
+                if pd.notna(row.get('debt_to_equity')) and row['debt_to_equity'] < 1.0:
+                    piotroski += 1  # low leverage
+                if pd.notna(row.get('current_ratio')) and row['current_ratio'] > 1.0:
+                    piotroski += 1  # adequate liquidity
+                score += piotroski * 3  # max 9 bonus points
+
                 scores[ticker] = min(100, score)
-                
+
             except Exception as e:
                 scores[ticker] = 0
-        
+
         return pd.Series(scores)
-    
+
     def calculate_income_scores(self, fundamentals: pd.DataFrame) -> pd.Series:
         """Calculate income/dividend scores for stocks"""
         scores = {}

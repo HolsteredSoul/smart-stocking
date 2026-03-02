@@ -494,10 +494,21 @@ class EnhancedUIComponents:
             
             st.plotly_chart(fig, use_container_width=True)
             
-            # Option to create PDF comparison report
+            # PDF comparison report
             if st.button("📑 Generate Comparison PDF Report"):
-                st.info("Generating PDF comparison report... This may take a moment.")
-                st.markdown("PDF report will be added here")
+                pdf_bytes = EnhancedUIComponents._generate_comparison_pdf(
+                    results_df, selected_tickers
+                )
+                if pdf_bytes:
+                    st.download_button(
+                        "📥 Download PDF Report",
+                        data=pdf_bytes,
+                        file_name="smartstock_comparison.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+                else:
+                    st.error("PDF generation failed. Please install fpdf2: pip install fpdf2")
         else:
             st.info("No analysis results yet. Please run a screening first in the Screening tab.")
     
@@ -608,12 +619,27 @@ class EnhancedUIComponents:
             if st.button("▶️ Run Backtest", type="primary"):
                 if not selected_strategies:
                     st.error("Please select at least one strategy to backtest")
+                elif start_date >= end_date:
+                    st.error("Start date must be before end date.")
                 else:
-                    with st.spinner("Running backtest... This may take several minutes depending on the settings."):
-                        # Placeholder for actual backtest results
-                        st.info("Backtest functionality will be implemented here")
-                        
-                        # Show sample results
+                    with st.spinner("Running backtest… fetching historical prices and scoring the universe."):
+                        from services.data_service import DataService
+                        from models.strategy_config import StrategyConfig
+                        bt_config = StrategyConfig(
+                            strategies=selected_strategies,
+                            tickers=tickers,
+                            custom_weights=weights,
+                        )
+                        result = DataService().run_backtest(
+                            config=bt_config,
+                            start_date=str(start_date),
+                            end_date=str(end_date),
+                            top_n=top_n,
+                        )
+
+                    if "error" in result:
+                        st.error(f"Backtest failed: {result['error']}")
+                        st.info("Showing illustrative sample results instead.")
                         EnhancedUIComponents.show_sample_backtest_results(
                             tickers=tickers,
                             start_date=start_date,
@@ -622,13 +648,133 @@ class EnhancedUIComponents:
                             rebalance_period=rebalance_period,
                             initial_capital=initial_capital,
                             benchmark=benchmark if benchmark != "None" else None,
-                            top_n=top_n
+                            top_n=top_n,
+                        )
+                    else:
+                        EnhancedUIComponents._show_real_backtest_results(
+                            result=result,
+                            initial_capital=initial_capital,
+                            benchmark=benchmark if benchmark != "None" else None,
                         )
     
     @staticmethod
-    def show_sample_backtest_results(tickers: List[str], start_date, end_date, 
-                                   strategies: List[str], rebalance_period: str,
-                                   initial_capital: float, benchmark: str = None, top_n: int = 5):
+    def _show_real_backtest_results(result: dict, initial_capital: float, benchmark: str = None):
+        """Display real backtest results returned by DataService.run_backtest()."""
+        st.subheader("Backtest Results")
+        st.caption(
+            f"Equal-weight portfolio of top {result.get('n_stocks', '?')} stocks: "
+            + ", ".join(result.get("top_tickers", []))
+        )
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Return", f"{result['total_return_pct']:.1f}%")
+        with col2:
+            st.metric("Ann. Return", f"{result['ann_return_pct']:.1f}%")
+        with col3:
+            st.metric("Sharpe Ratio", f"{result['sharpe_ratio']:.2f}")
+        with col4:
+            st.metric("Max Drawdown", f"{result['max_drawdown_pct']:.1f}%")
+
+        pv = result.get("portfolio_values")
+        if pv is not None and not pv.empty:
+            # Scale to initial capital
+            pv_scaled = pv * (initial_capital / 100)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=pv_scaled.index, y=pv_scaled["Portfolio Value"],
+                mode="lines", name="Strategy Portfolio",
+                line=dict(color="#636EFA", width=2),
+            ))
+            fig.update_layout(
+                title="Portfolio Value Over Time",
+                xaxis_title="Date", yaxis_title="Portfolio Value ($)",
+                height=400,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    @staticmethod
+    def _generate_comparison_pdf(results_df, tickers: List[str]) -> bytes:
+        """Generate a PDF report comparing selected stocks. Returns PDF bytes or None."""
+        try:
+            from fpdf import FPDF
+        except ImportError:
+            return None
+
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+
+        _SCORE_TIERS = [
+            (80, "Excellent"), (60, "Good"), (40, "Average"), (0, "Weak")
+        ]
+
+        def _tier(score):
+            for threshold, label in _SCORE_TIERS:
+                if score >= threshold:
+                    return label
+            return "Weak"
+
+        for ticker in tickers:
+            if ticker not in results_df.index:
+                continue
+            row = results_df.loc[ticker]
+            pdf.add_page()
+
+            # Header
+            pdf.set_font("Helvetica", "B", 18)
+            pdf.cell(0, 10, f"SmartStock Report: {ticker}", ln=True)
+            pdf.set_font("Helvetica", "", 11)
+            name = str(row.get("name", ""))
+            score = float(row.get("composite_score", 0))
+            pdf.cell(0, 7, f"{name}  |  Score: {score:.1f} ({_tier(score)})", ln=True)
+            pdf.cell(0, 7, f"Sector: {row.get('sector', 'N/A')}  |  Price: ${row.get('current_price', 0):.2f}", ln=True)
+            pdf.ln(4)
+
+            # Key metrics table
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.cell(0, 8, "Key Metrics", ln=True)
+            pdf.set_font("Helvetica", "", 10)
+            metrics = [
+                ("P/E Ratio",       f"{row.get('pe_ratio', float('nan')):.1f}"   if not pd.isna(row.get('pe_ratio', float('nan'))) else "N/A"),
+                ("P/B Ratio",       f"{row.get('pb_ratio', float('nan')):.2f}"   if not pd.isna(row.get('pb_ratio', float('nan'))) else "N/A"),
+                ("P/S Ratio",       f"{row.get('ps_ratio', float('nan')):.2f}"   if not pd.isna(row.get('ps_ratio', float('nan'))) else "N/A"),
+                ("Div Yield",       f"{row.get('dividend_yield', 0)*100:.2f}%"),
+                ("ROE",             f"{row.get('roe', float('nan'))*100:.1f}%"   if not pd.isna(row.get('roe', float('nan'))) else "N/A"),
+                ("Debt/Equity",     f"{row.get('debt_to_equity', float('nan')):.2f}" if not pd.isna(row.get('debt_to_equity', float('nan'))) else "N/A"),
+            ]
+            col_w = 95
+            for i, (label, value) in enumerate(metrics):
+                if i % 2 == 0:
+                    pdf.cell(col_w, 7, f"{label}: {value}", border=0)
+                else:
+                    pdf.cell(col_w, 7, f"{label}: {value}", border=0, ln=True)
+            if len(metrics) % 2 != 0:
+                pdf.ln(7)
+            pdf.ln(4)
+
+            # Strategy scores
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.cell(0, 8, "Strategy Scores", ln=True)
+            pdf.set_font("Helvetica", "", 10)
+            score_cols = {
+                "Momentum": "momentum_score", "Value": "value_score",
+                "Growth": "growth_score", "Quality": "quality_score",
+                "Income": "income_score", "Low Volatility": "volatility_score",
+            }
+            for strat, col in score_cols.items():
+                val = row.get(col)
+                if val is not None and not (isinstance(val, float) and pd.isna(val)):
+                    bar_w = int(float(val) / 100 * 80)
+                    pdf.cell(40, 6, strat, border=0)
+                    pdf.cell(bar_w, 6, "", border=0, fill=False)
+                    pdf.cell(0, 6, f"  {float(val):.1f} ({_tier(float(val))})", ln=True)
+
+        return bytes(pdf.output())
+
+    @staticmethod
+    def show_sample_backtest_results(tickers: List[str], start_date, end_date,
+                                     strategies: List[str], rebalance_period: str,
+                                     initial_capital: float, benchmark: str = None, top_n: int = 5):
         """Show sample backtest results for demonstration"""
         st.subheader("Backtest Results")
         

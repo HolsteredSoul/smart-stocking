@@ -376,27 +376,77 @@ class DataCacheManager:
             raise last_error
         raise RuntimeError(f"Failed to fetch data for {ticker} after {max_retries} attempts")
     
-    def _fetch_multiple_stock_data(self, tickers: List[str], data_type: str) -> Dict[str, Any]:
+    def _fetch_multiple_stock_data(self, tickers: List[str], data_type: str,
+                                   period: str = "1y") -> Dict[str, Any]:
         """
-        Fetch data for multiple tickers in a single request if supported.
-        
+        Fetch price data for multiple tickers in a single yfinance batch request.
+
+        Uses ``yf.download()`` with all tickers at once (much faster and uses
+        fewer rate-limit slots than individual calls).  Falls back to sequential
+        fetching if the batch call fails.
+
         Args:
-            tickers: List of stock symbols
-            data_type: Type of data to fetch
-            
+            tickers:   List of stock symbols.
+            data_type: Currently supports ``"price"``; falls back to sequential
+                       for ``"fundamentals"``.
+            period:    yfinance period string (e.g. ``"1y"``).
+
         Returns:
-            Dictionary mapping tickers to their data
+            Dict mapping each ticker to a DataFrame of OHLCV data.
         """
-        # This is a placeholder - you'll need to implement batch fetching
-        # in your data service if your APIs support it
-        from services.data_service import get_multiple_stock_data
-        
+        if data_type != "price":
+            # Fundamentals must still be fetched individually via the Ticker API
+            raise NotImplementedError(
+                f"Batch fetching is only implemented for 'price' data; "
+                f"got '{data_type}'. Use individual Ticker calls for fundamentals."
+            )
+
         try:
-            # Try to use batch API if available
-            return get_multiple_stock_data(tickers, data_type)
-        except (ImportError, AttributeError):
-            # Fallback to individual fetching if batch API not implemented
-            raise NotImplementedError("Batch fetching not implemented for this data type")
+            tickers_str = " ".join(tickers)
+            raw = yf.download(
+                tickers_str,
+                period=period,
+                group_by="ticker",
+                auto_adjust=True,
+                threads=True,
+                progress=False,
+            )
+
+            result: Dict[str, Any] = {}
+
+            if len(tickers) == 1:
+                # Single-ticker download returns a flat DataFrame, not grouped
+                ticker = tickers[0]
+                if not raw.empty:
+                    result[ticker] = raw.dropna(how="all")
+            else:
+                for ticker in tickers:
+                    try:
+                        df = raw[ticker].dropna(how="all")
+                        if not df.empty:
+                            result[ticker] = df
+                    except KeyError:
+                        pass  # Ticker not in batch result — skip silently
+
+            _get_logger().info(
+                f"Batch fetch returned data for {len(result)}/{len(tickers)} tickers."
+            )
+            return result
+
+        except Exception as exc:
+            _get_logger().warning(
+                f"Batch fetch failed ({exc}); falling back to sequential fetching."
+            )
+            # Fall back: fetch each ticker individually
+            result = {}
+            for ticker in tickers:
+                try:
+                    df = yf.Ticker(ticker).history(period=period, auto_adjust=True)
+                    if not df.empty:
+                        result[ticker] = df
+                except Exception:
+                    pass
+            return result
     
     def _maybe_trim_cache(self) -> None:
         """

@@ -1,0 +1,92 @@
+# SmartStock TODO
+
+> Tasks are organized by priority. Each item is scoped to one sitting.
+> File paths reference the exact location of the change needed.
+
+---
+
+## Critical — Broken or Blocking
+
+- [ ] **Fix broken test imports** — `tests/test_strategies.py` imports 8 classes that don't exist: `StrategyFactory`, `MomentumStrategy`, `ValueStrategy`, `GrowthStrategy`, `QualityStrategy`, `IncomeStrategy`, `LowVolatilityStrategy`, `CustomStrategy`. Either implement these classes in `models/strategy_config.py` or rewrite the tests to match the current architecture (scoring logic lives in `services/data_service.py`). Currently ~83% of tests fail immediately on import.
+
+- [ ] **Delete `app_backup.py`** — A stale 1,061-line copy of an older version of the main app. It adds confusion and is not imported anywhere. Safe to delete.
+
+- [ ] **Fix composite score inconsistency in demo mode** — `app.py` lines 852–855 calculate composite score as a plain `np.mean()` of all 6 strategy scores, bypassing the 3 configurable scoring methods (Rank Aggregation, Percentile, Custom Weights) that live in `services/data_service.py`. Demo mode results should use the same calculation path as real data.
+
+---
+
+## High — Ease of Use & Guiding Users to the Best Picks
+
+These tasks make the app useful for someone with no investment background.
+
+- [ ] **Add "Best Pick" spotlight card at the top of results** — Show the single highest-scoring stock prominently above the results table with its name, score, and a one-line reason (e.g., "Ranked #1 across your selected strategies"). Users should not have to read a table to find the winner. (`app.py`, Analysis page section)
+
+- [ ] **Add score tier labels and color coding** — A score of 72 is meaningless without context. Add a tier system: **Excellent** (80–100, green), **Good** (60–79, blue), **Average** (40–59, yellow), **Weak** (below 40, red). Apply these as colored badges in the results table and in the individual stock detail view. (`app.py`, `utils/enhanced_ui.py`)
+
+- [ ] **Add a plain-English summary sentence per stock** — Auto-generate a one-sentence description based on which strategies score highest, e.g. _"Strong momentum and growth stock with moderate valuation — suits an aggressive growth investor."_ Display it in the stock detail header. (`app.py`, individual stock detail section ~line 620)
+
+- [ ] **Add "Why this score?" breakdown in plain English** — Beneath each strategy score bar, show the 1–2 metrics that drove it. Example: _"Value score of 78 — low P/E (12.3) and P/B (1.4) signal the stock is underpriced."_ The factor data is already calculated in `data_service.py`; it just needs to be surfaced in the UI.
+
+- [ ] **Add a beginner "Investor Goal" selector** — At the top of the Screening page, offer 4–5 plain-English goals: _"I want steady income"_, _"I want long-term growth"_, _"I want low-risk stability"_, _"I want undervalued bargains"_, _"Balanced mix"_. Each maps to a preset strategy weight blend (presets already exist in `utils/enhanced_ui.py` lines 151–158). Hide the technical weight sliders by default; show them only in an "Advanced" expander.
+
+- [ ] **Label quadrants on the Risk vs. Score scatter plot** — The scatter plot in `utils/visualization.py:create_risk_return_scatter()` draws median lines but leaves quadrants blank. Add text annotations: _"Sweet Spot"_ (high score, low risk), _"High Risk / High Reward"_, _"Avoid"_ (low score, high risk), _"Safe but Slow"_. This makes the chart self-explanatory without needing a legend.
+
+- [ ] **Promote the Factor Contribution waterfall chart** — The `create_factor_contribution()` chart in `utils/visualization.py` shows exactly what drove each stock's score vs. the market average — it's the most insightful chart in the app but is buried. Move it to the top of the individual stock detail view, above the metric grid.
+
+- [ ] **Add sector diversification warning** — If the top 5 results are all from the same sector (e.g., all Technology), warn the user: _"Your top picks are heavily concentrated in one sector — consider diversifying."_ Calculate sector distribution from the results DataFrame in `app.py` after scoring.
+
+- [ ] **Add a "Recommended Stock Lists" shortcut** — Pre-load curated ticker sets with friendly names beyond the current technical presets. Examples: _"Dividend Aristocrats"_, _"Blue Chip Stability"_, _"High Growth Tech"_, _"Defensive Stocks"_. Include a short sentence describing each list. (`app.py`, ticker input section)
+
+- [ ] **Make the scoring method selector beginner-friendly** — The dropdown currently shows "Rank Aggregation", "Percentile Scoring", "Custom Weights" with no explanation. Add a tooltip or inline description for each: e.g., _"Rank Aggregation — compares stocks against each other (recommended for most users)"_.
+
+---
+
+## High — Stock Picking Technical Improvements
+
+These tasks make the scores more accurate and meaningful.
+
+- [ ] **Add RSI (Relative Strength Index) to Momentum scoring** — Current momentum scoring only uses price returns and SMAs. Add RSI-14 as a component: RSI 40–70 = healthy momentum (bonus points), RSI > 70 = overbought (cap bonus), RSI < 30 = oversold (penalty). RSI can be calculated from the price data already fetched. (`services/data_service.py:calculate_momentum_scores()`)
+
+- [ ] **Add volume confirmation to Momentum scoring** — A price increase on above-average volume is a stronger momentum signal. Compare recent volume to the 20-day average volume; give a bonus when price is up and volume is elevated. (`services/data_service.py:calculate_momentum_scores()`)
+
+- [ ] **Add P/S ratio to Value scoring** — Current value scoring uses P/E, P/B, and EV/EBITDA. P/S (Price-to-Sales) ratio is a key metric especially for companies with low or negative earnings. P/S < 2 is generally cheap; P/S > 10 is expensive. Add it as a 4th component. (`services/data_service.py:calculate_value_scores()`)
+
+- [ ] **Add sector-relative value thresholds** — The current value thresholds are absolute (e.g., P/E < 15 = max points). A P/E of 25 is cheap for software but expensive for retail. Normalise thresholds by sector median to make scoring relative to peers. Sector data is already present in fundamentals. (`services/data_service.py:calculate_value_scores()`)
+
+- [ ] **Replace revenue growth dividend proxy in Income scoring with actual dividend history** — Current income scoring uses revenue growth as a proxy for dividend sustainability. `yfinance` provides the actual `dividends` time series — use it to check dividend consistency (paid every quarter) and dividend growth direction (increasing year-over-year). (`services/data_service.py:calculate_income_scores()`)
+
+- [ ] **Add Piotroski F-Score to Quality scoring** — The Piotroski F-Score is a 9-point checklist (profitability, leverage, operating efficiency) widely used to identify high-quality stocks. Score 7–9 = strong, 4–6 = average, 0–3 = weak. The component metrics (ROA, cash flow, accruals, leverage change, current ratio change, shares issued, gross margin, asset turnover) are largely derivable from data already fetched. Replace or augment the current ROE/D-E/Current Ratio scoring. (`services/data_service.py:calculate_quality_scores()`)
+
+- [ ] **Add earnings quality check to Growth scoring** — High reported earnings growth can be misleading if cash flow from operations is not growing at a similar rate. Add a cash flow confirmation factor: if `operatingCashflow` growth matches or exceeds `epsGrowth`, give a bonus; if earnings are growing but cash flow is flat, apply a penalty. (`services/data_service.py:calculate_growth_scores()`)
+
+- [ ] **Add 52-week high/low positioning to Momentum scoring** — Stocks trading near their 52-week high with strong volume are in confirmed uptrends. Add a component: price within 5% of 52-week high = bonus, price within 20% of 52-week low = penalty. Derivable from fetched price data. (`services/data_service.py:calculate_momentum_scores()`)
+
+- [ ] **Normalize all strategy scores to be relative (percentile-within-screened-set), not absolute** — Currently all strategy scores are based on fixed thresholds (e.g., P/E < 15 = 30 pts). This means a set of 30 expensive tech stocks will all score low on value regardless of their relative ranking. Add a percentile normalization step after raw scoring so scores reflect rank within the screened universe. (`services/data_service.py:_calculate_composite_score()`)
+
+---
+
+## Medium — Incomplete Features
+
+- [ ] **Implement a basic backtest engine** — The backtest UI is fully built in `utils/enhanced_ui.py` lines 505–626 but returns hardcoded sample results. Implement the engine: for a given strategy config and date range, apply the scoring model at the start date, form a hypothetical equal-weight portfolio of the top N stocks, then calculate actual return using fetched historical price data. (`services/data_service.py` — new `run_backtest()` method)
+
+- [ ] **Implement PDF report export** — `utils/enhanced_ui.py:500` has a placeholder. Use `reportlab` or `fpdf2` (add to `requirements.txt`) to generate a single-page PDF per stock with the key metrics, score breakdown, and the factor contribution chart. (`utils/enhanced_ui.py`, export tab section)
+
+- [ ] **Implement batch ticker data fetching** — `utils/data_cache_manager.py:380–399` raises `NotImplementedError`. `yfinance.download()` accepts a list of tickers in one call and is significantly faster than looping. Implement the batch path for price data and fall back to individual calls for fundamentals. (`utils/data_cache_manager.py:fetch_multiple_tickers()`)
+
+- [ ] **Add missing strategy classes to satisfy tests** — Once a decision is made on whether to keep the test file or rewrite it, implement `StrategyFactory` and per-strategy classes (`MomentumStrategy`, `ValueStrategy`, etc.) as thin wrappers around the scoring methods in `data_service.py`. This gives a cleaner API and makes unit testing possible. (`models/strategy_config.py`)
+
+---
+
+## Low — Infrastructure & Maintenance
+
+- [ ] **Add GitHub Actions CI workflow** — Create `.github/workflows/ci.yml` to run `pytest tests/test_strategies.py::TestStrategyConfig` on every push and pull request. Blocks merges if tests fail.
+
+- [ ] **Add `pyproject.toml`** — Centralise project metadata, Python version requirement, tool config (black, isort, pytest settings). Makes the project installable with `pip install -e .` for development.
+
+- [ ] **Add `.streamlit/config.toml`** — Set explicit defaults for theme (light/dark), server port, and `maxUploadSize` instead of relying on Streamlit defaults. Prevents surprises across different deployment environments.
+
+- [ ] **Add `Dockerfile` and `docker-compose.yml`** — Makes local setup a single command (`docker compose up`) and enables consistent deployment to any cloud provider.
+
+- [ ] **Add integration test documentation to README** — The `TestDataService` class is silently skipped unless `RUN_INTEGRATION_TESTS=true` is set. Document this in `README.md` so contributors know how to run the full test suite.
+
+- [ ] **Centralise magic numbers into a constants module** — Scoring thresholds (P/E < 15, ROE > 20%, etc.), cache expiry times (5 min, 7 days), and default weights are hardcoded in multiple files. Move them to `models/constants.py` so they can be adjusted in one place.

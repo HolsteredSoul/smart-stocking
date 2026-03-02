@@ -38,6 +38,74 @@ STRATEGY_SCORE_COLUMNS = {
     'Low Volatility': 'volatility_score',
 }
 
+# ---------------------------------------------------------------------------
+# UI helpers
+# ---------------------------------------------------------------------------
+
+# Mapping: strategy → the 2 key metrics that explain its score, for plain-English display
+_STRATEGY_DRIVERS = {
+    "Momentum":       [("P/E Ratio", "pe_ratio", None), ("Beta", "beta", None)],  # price-based; fallback
+    "Value":          [("P/E Ratio", "pe_ratio", None), ("P/B Ratio", "pb_ratio", None)],
+    "Growth":         [("Revenue Growth", "revenue_growth", 100), ("EPS Growth", "eps_growth", 100)],
+    "Quality":        [("ROE", "roe", 100), ("Debt / Equity", "debt_to_equity", None)],
+    "Income":         [("Dividend Yield", "dividend_yield", 100), ("Payout Ratio", "payout_ratio", 100)],
+    "Low Volatility": [("Volatility", "volatility", 100), ("Beta", "beta", None)],
+}
+
+_GOAL_PRESETS = {
+    "I want steady income (dividends)":    "Dividend Focus",
+    "I want long-term growth":             "Balanced Growth",
+    "I want low-risk, stable stocks":      "Defensive",
+    "I want undervalued bargains":         "Classic Value",
+    "I want high momentum winners":        "Momentum Tilt",
+    "Let me configure manually":           None,
+}
+
+
+def score_tier(score: float) -> tuple:
+    """Return (label, hex-colour) for a composite score on a 0-100 scale."""
+    if score >= 80:
+        return "Excellent", "#28a745"
+    if score >= 60:
+        return "Good", "#17a2b8"
+    if score >= 40:
+        return "Average", "#ffc107"
+    return "Weak", "#dc3545"
+
+
+def _generate_summary(ticker: str, stock_data) -> str:
+    """Return a one-sentence plain-English description of a stock's strengths."""
+    strategy_scores = {
+        s: stock_data.get(col)
+        for s, col in STRATEGY_SCORE_COLUMNS.items()
+        if stock_data.get(col) is not None
+    }
+    if not strategy_scores:
+        return "Insufficient data to generate a summary."
+
+    sorted_strats = sorted(strategy_scores.items(), key=lambda x: x[1], reverse=True)
+    top = sorted_strats[:2]
+    bottom = sorted_strats[-1]
+
+    investor_map = {
+        "Momentum":       "momentum-focused",
+        "Value":          "value-oriented",
+        "Growth":         "growth-focused",
+        "Quality":        "quality-conscious",
+        "Income":         "income-seeking",
+        "Low Volatility": "risk-averse",
+    }
+
+    top_str = " and ".join(f"{s} ({v:.0f})" for s, v in top)
+    bottom_str = f"{bottom[0]} ({bottom[1]:.0f})"
+    investor_style = investor_map.get(top[0][0], "balanced")
+
+    return (
+        f"Strong {top_str} stock — suits a {investor_style} investor. "
+        f"Relatively weak {bottom_str} score."
+    )
+
+
 # Configure the Streamlit page
 st.set_page_config(
     page_title="SmartStock Screener",
@@ -249,9 +317,22 @@ def screening_page(data_service: DataService):
     if st.session_state.user_preferences.get('show_welcome', True):
         EnhancedUIComponents.show_welcome_section()
     
-    # Strategy selection
+    # --- Investor Goal selector (beginner-friendly entry point) ---
     st.header("Stock Screening Configuration")
-    
+    st.markdown("**What's your investment goal?**  *(We'll auto-select the right strategies for you)*")
+    goal = st.radio(
+        "Investment goal",
+        list(_GOAL_PRESETS.keys()),
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    selected_preset_from_goal = _GOAL_PRESETS.get(goal)
+    if selected_preset_from_goal:
+        st.caption(
+            f"Using the **{selected_preset_from_goal}** strategy blend. "
+            "Expand *Strategy Weights and Parameters* below to customise."
+        )
+
     # Define strategies
     strategies = {
         "Momentum": "12-month price momentum and trend analysis",
@@ -291,14 +372,26 @@ def screening_page(data_service: DataService):
     with col2:
         # Add preset ticker lists
         preset_lists = {
-            "S&P 500 Sample": ["AAPL", "MSFT", "AMZN", "GOOGL", "TSLA", "BRK-B", "UNH", "JNJ", "JPM", "XOM"],
-            "Tech Leaders": ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NFLX", "ORCL", "CSCO", "INTC", "IBM"],
-            "Dividend Kings": ["JNJ", "PG", "KO", "PEP", "WMT", "MCD", "MMM", "CVX", "XOM", "CL"],
-            "FAANG": ["META", "AAPL", "AMZN", "NFLX", "GOOGL"],
-            "Small Test (5)": ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]  # Added smaller test set
+            "S&P 500 Sample":       ["AAPL", "MSFT", "AMZN", "GOOGL", "TSLA", "BRK-B", "UNH", "JNJ", "JPM", "XOM"],
+            "Tech Leaders":          ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NFLX", "ORCL", "CSCO", "INTC", "IBM"],
+            "Dividend Kings":        ["JNJ", "PG", "KO", "PEP", "WMT", "MCD", "MMM", "CVX", "XOM", "CL"],
+            "FAANG":                 ["META", "AAPL", "AMZN", "NFLX", "GOOGL"],
+            "Dividend Aristocrats":  ["JNJ", "KO", "PG", "MMM", "CL", "PEP", "ABT", "T", "VZ", "ED"],
+            "Blue Chip Stability":   ["MSFT", "AAPL", "JPM", "V", "UNH", "HD", "MA", "PG", "JNJ", "BRK-B"],
+            "High Growth Tech":      ["NVDA", "META", "GOOGL", "AMZN", "TSLA", "CRM", "SNOW", "NET", "PLTR", "DDOG"],
+            "Defensive Stocks":      ["KO", "PG", "JNJ", "GIS", "CPB", "HSY", "MKC", "CLX", "SJM", "CAG"],
+            "Small Test (5)":        ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"],
         }
-        
+        _preset_descriptions = {
+            "Dividend Aristocrats":  "25+ consecutive years of dividend increases — stability and income.",
+            "Blue Chip Stability":   "Market-leading companies with strong balance sheets.",
+            "High Growth Tech":      "Fast-growing tech companies with high upside potential.",
+            "Defensive Stocks":      "Consumer staples that hold up well in market downturns.",
+        }
+
         selected_preset = st.selectbox("Or choose a preset list:", ["Custom"] + list(preset_lists.keys()))
+        if selected_preset in _preset_descriptions:
+            st.caption(_preset_descriptions[selected_preset])
         
         if selected_preset != "Custom":
             tickers_input = ", ".join(preset_lists[selected_preset])
@@ -344,7 +437,11 @@ def screening_page(data_service: DataService):
                 "Scoring method",
                 ["Rank Aggregation", "Percentile Scoring", "Custom Weights"],
                 index=default_scoring_idx,
-                help="How to combine strategy scores"
+                help=(
+                    "Rank Aggregation — compares stocks against each other (recommended for most users). "
+                    "Percentile Scoring — converts each score to a 0–100 percentile within your stock universe. "
+                    "Custom Weights — applies your weight sliders directly as a weighted average."
+                )
             )
         
         with col2:
@@ -523,7 +620,41 @@ def analysis_page(data_service: DataService):
         st.metric("Avg Score", f"{results_df['composite_score'].mean():.1f}")
     with col4:
         st.metric("Strategies", len(st.session_state.selected_strategies))
-    
+
+    # --- Best Pick spotlight card ---
+    best_ticker = results_df['composite_score'].idxmax()
+    best = results_df.loc[best_ticker]
+    b_label, b_color = score_tier(best['composite_score'])
+    b_summary = _generate_summary(best_ticker, best)
+    st.markdown(
+        f"""
+        <div style="background:#f0f8ff;border-left:6px solid {b_color};
+                    padding:14px 18px;border-radius:6px;margin:12px 0 4px 0">
+          <h3 style="margin:0 0 4px 0">⭐ Top Pick: {best_ticker}
+            &nbsp;<span style="font-size:0.85em;color:#555">— {best.get('name','')}</span></h3>
+          <p style="margin:2px 0">
+            Score: <strong style="color:{b_color}">{best['composite_score']:.1f}
+            &nbsp;({b_label})</strong>
+            &nbsp;|&nbsp; Sector: {best.get('sector','N/A')}
+            &nbsp;|&nbsp; Price: ${best.get('current_price', 0):.2f}
+          </p>
+          <p style="margin:4px 0 0 0;color:#555;font-size:0.9em">{b_summary}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # --- Sector concentration warning ---
+    if len(results_df) >= 5:
+        top5 = results_df.nlargest(5, 'composite_score')
+        sector_counts = top5['sector'].value_counts()
+        if not sector_counts.empty and sector_counts.iloc[0] >= 4:
+            dom_sector = sector_counts.index[0]
+            st.warning(
+                f"⚠️ Your top 5 picks are heavily concentrated in **{dom_sector}** "
+                f"({sector_counts.iloc[0]}/5 stocks). Consider diversifying across sectors."
+            )
+
     st.divider()
     
     # --- Build a clean display table ---
@@ -595,7 +726,11 @@ def analysis_page(data_service: DataService):
             display_df[col_label] = filtered_df[col_key].apply(
                 lambda x: f"{x:.1f}" if pd.notna(x) else "N/A"
             )
-        else:  # Score columns
+        elif col_key == 'composite_score':
+            display_df[col_label] = filtered_df[col_key].apply(
+                lambda x: f"{x:.1f} ({score_tier(x)[0]})" if pd.notna(x) else "—"
+            )
+        else:  # Individual strategy score columns
             display_df[col_label] = filtered_df[col_key].apply(
                 lambda x: f"{x:.1f}" if pd.notna(x) else "—"
             )
@@ -636,27 +771,37 @@ def analysis_page(data_service: DataService):
 def stock_detail_view(ticker: str, results_df: pd.DataFrame):
     """Display detailed view for a single stock"""
     stock_data = results_df.loc[ticker]
-    
+
     # --- Helper to safely format values ---
     def fmt(key, fmt_str, suffix='', scale=1, fallback='N/A'):
         val = stock_data.get(key)
         if pd.isna(val) if isinstance(val, float) else val is None:
             return fallback
         return f"{fmt_str.format(val * scale)}{suffix}"
-    
+
     # --- Stock header ---
     mkt_cap = stock_data.get('market_cap', 0)
     mkt_cap_str = f"${mkt_cap/1e9:.1f}B" if mkt_cap >= 1e9 else f"${mkt_cap/1e6:.0f}M"
-    
-    col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
+    raw_score = stock_data.get('composite_score', 0)
+    tier_label, tier_color = score_tier(raw_score)
+
+    col1, col2, col3, col4, col5 = st.columns([3, 1, 1, 1, 1])
     with col1:
         st.markdown(f"### {ticker} — {stock_data.get('name', 'N/A')}")
+        st.caption(_generate_summary(ticker, stock_data))
     with col2:
         st.metric("Price", f"${stock_data.get('current_price', 0):.2f}")
     with col3:
         st.metric("Mkt Cap", mkt_cap_str)
     with col4:
-        st.metric("Score", f"{stock_data.get('composite_score', 0):.1f}")
+        st.metric("Score", f"{raw_score:.1f}")
+    with col5:
+        st.markdown(
+            f"<div style='padding:6px 10px;border-radius:4px;background:{tier_color};"
+            f"color:#fff;text-align:center;font-weight:bold;margin-top:8px'>"
+            f"{tier_label}</div>",
+            unsafe_allow_html=True,
+        )
     
     # --- Tabs ---
     tabs = st.tabs(["Overview", "Strategy Scores", "Financials", "Export"])
@@ -684,11 +829,21 @@ def stock_detail_view(ticker: str, results_df: pd.DataFrame):
             score_col = STRATEGY_SCORE_COLUMNS.get(strategy, f"{strategy.lower()}_score")
             if score_col in stock_data:
                 strategy_scores[strategy] = stock_data[score_col]
-        
+
         if not strategy_scores:
             st.info("No strategy scores available.")
         else:
-            # Always show bar chart
+            # --- Factor contribution waterfall (most insightful view — shown first) ---
+            chart_builder = ChartBuilder()
+            fig_waterfall = chart_builder.create_factor_contribution(results_df, ticker)
+            if fig_waterfall and fig_waterfall.data:
+                st.plotly_chart(fig_waterfall, use_container_width=True)
+                st.caption(
+                    "Each bar shows how much this stock's strategy score is **above or below the "
+                    "group average**. Positive bars (green) are strengths; negative (red) are weaknesses."
+                )
+
+            # --- Bar chart ---
             fig = go.Figure(go.Bar(
                 x=list(strategy_scores.keys()),
                 y=list(strategy_scores.values()),
@@ -698,8 +853,27 @@ def stock_detail_view(ticker: str, results_df: pd.DataFrame):
             ))
             fig.update_layout(yaxis_range=[0, 100], height=350, margin=dict(t=30, b=30))
             st.plotly_chart(fig, use_container_width=True)
-            
-            # Radar chart only if 3+ strategies
+
+            # --- "Why this score?" plain-English breakdown ---
+            with st.expander("What drives these scores?"):
+                for strategy, score in strategy_scores.items():
+                    s_label, s_color = score_tier(score)
+                    drivers = _STRATEGY_DRIVERS.get(strategy, [])
+                    driver_strs = []
+                    for d_label, d_key, d_scale in drivers:
+                        raw = stock_data.get(d_key)
+                        if raw is not None and not (isinstance(raw, float) and pd.isna(raw)):
+                            val_str = f"{raw * d_scale:.1f}%" if d_scale else f"{raw:.2f}"
+                            driver_strs.append(f"{d_label}: **{val_str}**")
+                    driver_text = " | ".join(driver_strs) if driver_strs else "metric data unavailable"
+                    st.markdown(
+                        f"**{strategy}** — "
+                        f"<span style='color:{s_color}'>{score:.1f} ({s_label})</span>  \n"
+                        f"<span style='font-size:0.88em;color:#555'>{driver_text}</span>",
+                        unsafe_allow_html=True,
+                    )
+
+            # --- Radar chart only if 3+ strategies ---
             if len(strategy_scores) >= 3:
                 cats = list(strategy_scores.keys())
                 vals = list(strategy_scores.values())
@@ -748,6 +922,22 @@ def stock_detail_view(ticker: str, results_df: pd.DataFrame):
     
     # ---- Export tab ----
     with tabs[3]:
+        # PDF report
+        if st.button("📑 Download PDF Report", key="stock_pdf_btn", use_container_width=True):
+            from utils.enhanced_ui import EnhancedUIComponents
+            pdf_bytes = EnhancedUIComponents._generate_comparison_pdf(results_df, [ticker])
+            if pdf_bytes:
+                st.download_button(
+                    "📥 Save PDF",
+                    data=pdf_bytes,
+                    file_name=f"{ticker}_smartstock.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key="stock_pdf_dl",
+                )
+            else:
+                st.warning("Install fpdf2 (`pip install fpdf2`) to enable PDF exports.")
+
         if st.button("📊 Generate Excel Report", key="stock_excel_btn", use_container_width=True):
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
@@ -849,10 +1039,18 @@ def create_demo_data(tickers: List[str]) -> pd.DataFrame:
             'volatility': np.random.uniform(0.15, 0.45)
         }
         
-        # Calculate composite score using all 6 strategy score columns
-        scores = [data['momentum_score'], data['value_score'], data['growth_score'],
-                  data['quality_score'], data['income_score'], data['volatility_score']]
-        data['composite_score'] = np.mean(scores)
+        # Calculate composite score respecting selected strategies and custom weights
+        selected = st.session_state.get('selected_strategies', list(STRATEGY_SCORE_COLUMNS.keys()))
+        w = st.session_state.get('custom_weights', {})
+        score_cols = {s: STRATEGY_SCORE_COLUMNS[s] for s in selected if s in STRATEGY_SCORE_COLUMNS}
+        if w:
+            total_w = sum(w.get(s, 1.0) for s in score_cols) or 1.0
+            data['composite_score'] = sum(
+                data[col] * w.get(s, 1.0) / total_w
+                for s, col in score_cols.items()
+            )
+        else:
+            data['composite_score'] = np.mean([data[col] for col in score_cols.values()])
         
         demo_data.append(data)
     
