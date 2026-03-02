@@ -1,0 +1,1526 @@
+"""
+Data Service Module for SmartStock
+Handles data fetching from various financial APIs
+"""
+
+import asyncio
+import logging
+import os
+import random
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import aiohttp
+import numpy as np
+import pandas as pd
+import streamlit as st
+import yfinance as yf
+
+# Canonical mapping: strategy display name -> score column name
+# Must stay in sync with the copy in app.py
+STRATEGY_SCORE_COLUMNS = {
+    'Momentum': 'momentum_score',
+    'Value': 'value_score',
+    'Growth': 'growth_score',
+    'Quality': 'quality_score',
+    'Income': 'income_score',
+    'Low Volatility': 'volatility_score',
+}
+
+class DataService:
+    """Handles all data fetching and processing operations"""
+    
+    def __init__(self):
+        # Set up logging
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger("SmartStock")
+        
+        # Try to get API keys, but don't fail if they're not available
+        try:
+            self.alpha_vantage_key = st.secrets.get("ALPHA_VANTAGE_API_KEY", "")
+            self.finnhub_key = st.secrets.get("FINNHUB_API_KEY", "")
+            self.fmp_key = st.secrets.get("FMP_API_KEY", "")
+            self.polygon_key = st.secrets.get("POLYGON_API_KEY", "")
+        except Exception:
+            # If secrets aren't configured, use empty strings
+            self.alpha_vantage_key = ""
+            self.finnhub_key = ""
+            self.fmp_key = ""
+            self.polygon_key = ""
+            
+        # Initialize HTTP sessions
+        self.session = None
+        
+        # Rate limiting with exponential backoff
+        self.last_api_call = {}
+        self.call_delay = {
+            "yahoo": 1.0,
+            "alpha_vantage": 13.0, 
+            "finnhub": 1.0, 
+            "fmp": 0.5,
+            "polygon": 0.3
+        }  # seconds between calls
+        
+        # Data source priorities
+        self.data_sources = ["yahoo"]
+        if self.alpha_vantage_key:
+            self.data_sources.append("alpha_vantage")
+        if self.finnhub_key:
+            self.data_sources.append("finnhub")
+        if self.fmp_key:
+            self.data_sources.append("fmp")
+        if self.polygon_key:
+            self.data_sources.append("polygon")
+            
+        # Cache for API responses to reduce duplicate calls
+        self.response_cache = {}
+    
+    def _run_sync(self, coro):
+        """Execute an async coroutine from synchronous context safely."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            new_loop = asyncio.new_event_loop()
+            try:
+                return new_loop.run_until_complete(coro)
+            finally:
+                new_loop.close()
+
+        return asyncio.run(coro)
+
+    # ------------------------------------------------------------------
+    # Public synchronous helpers used by cache manager / other layers
+    # ------------------------------------------------------------------
+
+    def fetch_data_sync(self, ticker: str, data_type: str, period: str = "1y") -> Any:
+        """Fetch data synchronously by delegating to async implementations."""
+        if data_type in {"price", "intraday", "chart_data", "technical"}:
+            data = self._run_sync(self._fetch_stock_data_async([ticker], period))
+            return data.get(ticker)
+        if data_type in {"fundamental", "financial", "profile", "summary",
+                         "institutional", "insider"}:
+            fundamentals = self._run_sync(self._get_fundamentals_async([ticker]))
+            if fundamentals is None or fundamentals.empty:
+                return None
+            return fundamentals.loc[ticker] if ticker in fundamentals.index else None
+        raise ValueError(f"Unsupported data_type '{data_type}' for fetch_data_sync")
+
+    def fetch_multiple_data_sync(self, tickers: List[str], data_type: str, period: str = "1y") -> Dict[str, Any]:
+        """Batch synchronous fetch helper."""
+        if data_type in {"price", "intraday", "chart_data", "technical"}:
+            return self._run_sync(self._fetch_stock_data_async(tickers, period))
+        if data_type in {"fundamental", "financial", "profile", "summary",
+                         "institutional", "insider"}:
+            fundamentals = self._run_sync(self._get_fundamentals_async(tickers))
+            if fundamentals is None or fundamentals.empty:
+                return {}
+            return fundamentals.to_dict(orient="index")
+        raise ValueError(f"Unsupported data_type '{data_type}' for fetch_multiple_data_sync")
+
+    def __del__(self):
+        """Cleanup resources when the object is deleted"""
+        try:
+            # Check if there's an event loop running
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Schedule the close_session function to run
+                loop.create_task(self.close_session())
+            else:
+                # If no loop is running, create a new one to close the session
+                try:
+                    asyncio.run(self.close_session())
+                except RuntimeError:
+                    # Handle "RuntimeError: There is no current event loop in thread"
+                    pass
+        except Exception as e:
+            # Just log errors during cleanup
+            print(f"Error during DataService cleanup: {str(e)}")
+    
+    async def initialize_session(self):
+        """Initialize aiohttp session if not already created"""
+        if self.session is None:
+            self.session = aiohttp.ClientSession()
+            
+    async def close_session(self):
+        """Close aiohttp session if open"""
+        if self.session is not None:
+            await self.session.close()
+            self.session = None
+            
+    def _get_api_call_delay(self, source: str, attempt: int = 0) -> float:
+        """Calculate delay with exponential backoff"""
+        base_delay = self.call_delay.get(source, 1.0)
+        jitter = random.uniform(0, 0.5)  # Add randomness to avoid thundering herd
+        return base_delay * (2 ** attempt) + jitter
+        
+    async def _make_api_call(self, source: str, url: str, params: Dict = None, headers: Dict = None, 
+                            max_retries: int = 3) -> Tuple[bool, Any]:
+        """Make API call with rate limiting and exponential backoff"""
+        await self.initialize_session()
+        
+        # Check cache first
+        cache_key = f"{url}_{str(params)}"
+        if cache_key in self.response_cache:
+            return True, self.response_cache[cache_key]
+        
+        for attempt in range(max_retries):
+            # Apply rate limiting
+            now = time.time()
+            if source in self.last_api_call:
+                elapsed = now - self.last_api_call[source]
+                delay = self._get_api_call_delay(source, attempt)
+                if elapsed < delay:
+                    wait_time = delay - elapsed
+                    self.logger.debug(f"Rate limiting {source}: waiting {wait_time:.2f}s")
+                    await asyncio.sleep(wait_time)
+            
+            # Make the call
+            try:
+                self.last_api_call[source] = time.time()
+                async with self.session.get(url, params=params, headers=headers) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        # Cache successful response
+                        self.response_cache[cache_key] = result
+                        return True, result
+                    elif response.status == 429:  # Rate limit
+                        wait_time = self._get_api_call_delay(source, attempt + 2)  # Longer wait for rate limits
+                        self.logger.warning(f"{source} rate limit hit. Waiting {wait_time:.2f}s before retry.")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        self.logger.warning(f"{source} API returned status {response.status}")
+                        await asyncio.sleep(self._get_api_call_delay(source, attempt))
+            except Exception as e:
+                self.logger.warning(f"Error calling {source} API: {str(e)}")
+                await asyncio.sleep(self._get_api_call_delay(source, attempt))
+                
+        return False, None
+    
+    @st.cache_data(ttl=3600)  # Cache for 1 hour
+    def fetch_stock_data(_self, tickers: List[str], period: str = "1y") -> Dict[str, pd.DataFrame]:
+        """Fetch historical data for multiple tickers (session-cached by Streamlit)"""
+        return _self._run_sync(_self._fetch_stock_data_async(tickers, period))
+        
+    async def _fetch_stock_data_async(self, tickers: List[str], period: str = "1y") -> Dict[str, pd.DataFrame]:
+        """Async implementation of fetch_stock_data"""
+        data = {}
+        
+        # Create progress tracking
+        progress_placeholder = st.empty()
+        progress_placeholder.text(f"Fetching data for {len(tickers)} stocks...")
+        
+        # Use semaphore to limit concurrent requests
+        semaphore = asyncio.Semaphore(5)  # Max 5 concurrent requests
+        
+        async def fetch_with_semaphore(ticker):
+            async with semaphore:
+                return ticker, await self._fetch_single_stock_async(ticker, period)
+        
+        # Create tasks for all tickers
+        tasks = [fetch_with_semaphore(ticker) for ticker in tickers]
+        
+        # Process results as they complete
+        for i, task in enumerate(asyncio.as_completed(tasks)):
+            ticker, result = await task
+            if result is not None and not result.empty:
+                data[ticker] = result
+            else:
+                st.warning(f"No data retrieved for {ticker}")
+                
+            # Update progress
+            progress = (i + 1) / len(tickers)
+            progress_placeholder.text(f"Fetched {i+1}/{len(tickers)} stocks ({progress:.0%})")
+        
+        # Clear progress indicator
+        progress_placeholder.empty()
+        
+        return data
+    
+    async def _fetch_single_stock_async(self, ticker: str, period: str) -> pd.DataFrame:
+        """Fetch data for a single stock asynchronously with multiple source fallbacks"""
+        # Try each data source in order of priority
+        for source in self.data_sources:
+            try:
+                if source == "yahoo":
+                    data = await self._fetch_from_yahoo(ticker, period)
+                elif source == "alpha_vantage" and self.alpha_vantage_key:
+                    data = await self._fetch_from_alpha_vantage(ticker, period)
+                elif source == "finnhub" and self.finnhub_key:
+                    data = await self._fetch_from_finnhub(ticker, period)
+                elif source == "fmp" and self.fmp_key:
+                    data = await self._fetch_from_fmp(ticker, period)
+                elif source == "polygon" and self.polygon_key:
+                    data = await self._fetch_from_polygon(ticker, period)
+                else:
+                    continue
+                    
+                if data is not None and not data.empty:
+                    self.logger.info(f"Successfully fetched {ticker} data from {source}")
+                    return data
+            except Exception as e:
+                self.logger.warning(f"Error fetching {ticker} from {source}: {str(e)}")
+                continue
+                
+        # If all sources failed, return empty DataFrame
+        self.logger.warning(f"All data sources failed for {ticker}")
+        return pd.DataFrame()
+        
+    async def _fetch_from_yahoo(self, ticker: str, period: str) -> pd.DataFrame:
+        """Fetch data from Yahoo Finance"""
+        # Need to use ThreadPoolExecutor since yfinance is not async
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as pool:
+            try:
+                # Apply rate limiting
+                await asyncio.sleep(self._get_api_call_delay("yahoo"))
+                
+                def _fetch():
+                    try:
+                        stock = yf.Ticker(ticker)
+                        # Add User-Agent header to reduce likelihood of rate limiting
+                        stock.session.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/106.0.0.0 Safari/537.36'
+                        
+                        # First try to get history
+                        for attempt in range(3):
+                            try:
+                                hist = stock.history(period=period)
+                                if hist.empty and attempt < 2:
+                                    time.sleep(2 * (attempt + 1))  # Exponential backoff
+                                    continue
+                                break
+                            except Exception as e:
+                                if "Too Many Requests" in str(e) or "Rate limit" in str(e):
+                                    wait_time = 5 * (attempt + 1)
+                                    self.logger.warning(f"Rate limited during history fetch for {ticker}. Waiting {wait_time}s")
+                                    time.sleep(wait_time)
+                                    continue
+                                raise
+                        
+                        if hist.empty:
+                            self.logger.warning(f"Empty history for {ticker} after retries")
+                            return pd.DataFrame()
+                            
+                        # Then get info with separate retries
+                        for info_attempt in range(3):
+                            try:
+                                info = stock.info
+                                if info and len(info) > 1:
+                                    hist['market_cap'] = info.get('marketCap', np.nan)
+                                    hist['pe_ratio'] = info.get('trailingPE', np.nan)
+                                    hist['dividend_yield'] = info.get('dividendYield', 0)
+                                    hist['beta'] = info.get('beta', np.nan)
+                                break
+                            except Exception as e:
+                                self.logger.warning(f"Error getting info for {ticker} (attempt {info_attempt+1}): {str(e)}")
+                                if info_attempt < 2:
+                                    time.sleep(3 * (info_attempt + 1))
+                        
+                        return hist
+                        
+                    except Exception as e:
+                        if "Too Many Requests" in str(e) or "Rate limit" in str(e):
+                            self.logger.error(f"Rate limited for {ticker}: {str(e)}")
+                            raise Exception(f"Rate limited: {str(e)}")
+                        self.logger.error(f"Failed to fetch {ticker}: {str(e)}")
+                        return pd.DataFrame()
+                    
+                return await loop.run_in_executor(pool, _fetch)
+            except Exception as e:
+                self.logger.warning(f"Error in Yahoo Finance fetch for {ticker}: {str(e)}")
+                return pd.DataFrame()
+            
+    async def _fetch_from_alpha_vantage(self, ticker: str, period: str) -> pd.DataFrame:
+        """Fetch data from Alpha Vantage API"""
+        try:
+            # Convert period to Alpha Vantage format
+            output_size = "full" if period in ["1y", "2y", "5y", "10y", "max"] else "compact"
+            
+            # Get daily time series
+            base_url = "https://www.alphavantage.co/query"
+            params = {
+                "function": "TIME_SERIES_DAILY",
+                "symbol": ticker,
+                "outputsize": output_size,
+                "apikey": self.alpha_vantage_key
+            }
+            
+            success, data = await self._make_api_call("alpha_vantage", base_url, params)
+            
+            if not success or "Time Series (Daily)" not in data:
+                return pd.DataFrame()
+                
+            # Parse the response
+            time_series = data["Time Series (Daily)"]
+            df = pd.DataFrame.from_dict(time_series, orient="index")
+            
+            # Rename columns
+            df = df.rename(columns={
+                "1. open": "Open",
+                "2. high": "High",
+                "3. low": "Low",
+                "4. close": "Close",
+                "5. volume": "Volume"
+            })
+            
+            # Convert index to datetime and data to numeric
+            df.index = pd.to_datetime(df.index)
+            for col in df.columns:
+                df[col] = pd.to_numeric(df[col])
+                
+            # Add overview data if available
+            try:
+                overview_params = {
+                    "function": "OVERVIEW",
+                    "symbol": ticker,
+                    "apikey": self.alpha_vantage_key
+                }
+                
+                success, overview = await self._make_api_call("alpha_vantage", base_url, overview_params)
+                
+                if success and overview:
+                    df['market_cap'] = float(overview.get('MarketCapitalization', np.nan))
+                    df['pe_ratio'] = float(overview.get('PERatio', np.nan))
+                    df['dividend_yield'] = float(overview.get('DividendYield', 0))
+                    df['beta'] = float(overview.get('Beta', np.nan))
+            except Exception as e:
+                self.logger.warning(f"Error getting Alpha Vantage overview for {ticker}: {str(e)}")
+                
+            # Limit to the requested period
+            if period == "1mo":
+                df = df.iloc[:30]
+            elif period == "3mo":
+                df = df.iloc[:90]
+            elif period == "6mo":
+                df = df.iloc[:180]
+            elif period == "1y":
+                df = df.iloc[:252]
+                
+            return df
+            
+        except Exception as e:
+            self.logger.warning(f"Error in Alpha Vantage fetch for {ticker}: {str(e)}")
+            return pd.DataFrame()
+            
+    async def _fetch_from_finnhub(self, ticker: str, period: str) -> pd.DataFrame:
+        """Fetch data from Finnhub API"""
+        try:
+            # Convert period to timestamps
+            end_date = datetime.now()
+            
+            if period == "1mo":
+                start_date = end_date - timedelta(days=30)
+            elif period == "3mo":
+                start_date = end_date - timedelta(days=90)
+            elif period == "6mo":
+                start_date = end_date - timedelta(days=180)
+            elif period == "1y":
+                start_date = end_date - timedelta(days=365)
+            elif period == "2y":
+                start_date = end_date - timedelta(days=730)
+            else:
+                start_date = end_date - timedelta(days=365)  # Default to 1 year
+                
+            # Convert to UNIX timestamps
+            from_timestamp = int(start_date.timestamp())
+            to_timestamp = int(end_date.timestamp())
+            
+            # Set up request
+            base_url = "https://finnhub.io/api/v1/stock/candle"
+            params = {
+                "symbol": ticker,
+                "resolution": "D",  # Daily
+                "from": from_timestamp,
+                "to": to_timestamp,
+                "token": self.finnhub_key
+            }
+            
+            success, data = await self._make_api_call("finnhub", base_url, params)
+            
+            if not success or data.get('s') != 'ok':
+                return pd.DataFrame()
+                
+            # Create DataFrame
+            df = pd.DataFrame({
+                'Open': data['o'],
+                'High': data['h'],
+                'Low': data['l'],
+                'Close': data['c'],
+                'Volume': data['v']
+            }, index=pd.to_datetime(data['t'], unit='s'))
+            
+            # Get company profile for additional info
+            profile_url = "https://finnhub.io/api/v1/stock/profile2"
+            profile_params = {
+                "symbol": ticker,
+                "token": self.finnhub_key
+            }
+            
+            success, profile = await self._make_api_call("finnhub", profile_url, profile_params)
+            
+            if success and profile:
+                df['market_cap'] = profile.get('marketCapitalization', np.nan) * 1e6  # Convert from millions
+                df['beta'] = profile.get('beta', np.nan)
+                
+            # Get basic financials for additional ratios
+            metrics_url = "https://finnhub.io/api/v1/stock/metric"
+            metrics_params = {
+                "symbol": ticker,
+                "metric": "all",
+                "token": self.finnhub_key
+            }
+            
+            success, metrics = await self._make_api_call("finnhub", metrics_url, metrics_params)
+            
+            if success and metrics and 'metric' in metrics:
+                metrics_data = metrics['metric']
+                df['pe_ratio'] = metrics_data.get('peBasicExclExtraTTM', np.nan)
+                df['dividend_yield'] = metrics_data.get('dividendYieldIndicatedAnnual', 0) / 100  # Convert from percentage
+                
+            return df
+            
+        except Exception as e:
+            self.logger.warning(f"Error in Finnhub fetch for {ticker}: {str(e)}")
+            return pd.DataFrame()
+            
+    async def _fetch_from_fmp(self, ticker: str, period: str) -> pd.DataFrame:
+        """Fetch data from Financial Modeling Prep API"""
+        try:
+            # Map period to API parameter
+            if period == "1mo":
+                time_delta = "1month"
+            elif period == "3mo":
+                time_delta = "3month"
+            elif period == "6mo":
+                time_delta = "6month"
+            elif period == "1y":
+                time_delta = "1year"
+            elif period == "2y":
+                time_delta = "2year"
+            else:
+                time_delta = "1year"  # Default
+                
+            # Get historical data
+            base_url = "https://financialmodelingprep.com/api/v3/historical-price-full"
+            params = {
+                "symbol": ticker,
+                "timeseries": time_delta,
+                "apikey": self.fmp_key
+            }
+            
+            success, data = await self._make_api_call("fmp", base_url, params)
+            
+            if not success or 'historical' not in data:
+                return pd.DataFrame()
+                
+            # Parse historical data
+            historical = data['historical']
+            df = pd.DataFrame(historical)
+            
+            # Format DataFrame
+            df = df.rename(columns={
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "volume": "Volume",
+                "date": "Date"
+            })
+            
+            # Set index and sort
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.set_index('Date')
+            df = df.sort_index()
+            
+            # Get company profile
+            profile_url = "https://financialmodelingprep.com/api/v3/profile"
+            profile_params = {
+                "symbol": ticker,
+                "apikey": self.fmp_key
+            }
+            
+            success, profiles = await self._make_api_call("fmp", profile_url, profile_params)
+            
+            if success and profiles and len(profiles) > 0:
+                profile = profiles[0]
+                df['market_cap'] = profile.get('mktCap', np.nan)
+                df['beta'] = profile.get('beta', np.nan)
+                df['pe_ratio'] = profile.get('pe', np.nan)
+                df['dividend_yield'] = profile.get('lastDiv', 0) / profile.get('price', 1) if profile.get('price', 0) > 0 else 0
+                
+            return df
+            
+        except Exception as e:
+            self.logger.warning(f"Error in FMP fetch for {ticker}: {str(e)}")
+            return pd.DataFrame()
+            
+    async def _fetch_from_polygon(self, ticker: str, period: str) -> pd.DataFrame:
+        """Fetch data from Polygon.io API"""
+        try:
+            # Calculate date range
+            end_date = datetime.now()
+            
+            if period == "1mo":
+                start_date = end_date - timedelta(days=30)
+            elif period == "3mo":
+                start_date = end_date - timedelta(days=90)
+            elif period == "6mo":
+                start_date = end_date - timedelta(days=180)
+            elif period == "1y":
+                start_date = end_date - timedelta(days=365)
+            elif period == "2y":
+                start_date = end_date - timedelta(days=730)
+            else:
+                start_date = end_date - timedelta(days=365)  # Default to 1 year
+                
+            # Format dates for API
+            from_date = start_date.strftime("%Y-%m-%d")
+            to_date = end_date.strftime("%Y-%m-%d")
+            
+            # Get aggregates (OHLC) data
+            base_url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{from_date}/{to_date}"
+            params = {
+                "apiKey": self.polygon_key,
+                "sort": "asc"
+            }
+            
+            success, data = await self._make_api_call("polygon", base_url, params)
+            
+            if not success or 'results' not in data:
+                return pd.DataFrame()
+                
+            # Parse response
+            results = data['results']
+            df = pd.DataFrame(results)
+            
+            # Rename columns to standard format
+            df = df.rename(columns={
+                "o": "Open",
+                "h": "High",
+                "l": "Low",
+                "c": "Close",
+                "v": "Volume",
+                "t": "timestamp"
+            })
+            
+            # Convert timestamp to datetime (milliseconds to seconds)
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df = df.set_index('timestamp')
+            
+            # Get ticker details
+            details_url = f"https://api.polygon.io/v3/reference/tickers/{ticker}"
+            details_params = {
+                "apiKey": self.polygon_key
+            }
+            
+            success, details = await self._make_api_call("polygon", details_url, details_params)
+            
+            if success and 'results' in details:
+                ticker_details = details['results']
+                df['market_cap'] = ticker_details.get('market_cap', np.nan)
+                
+                # Get financials for ratios
+                financials_url = f"https://api.polygon.io/v2/reference/financials/{ticker}"
+                financials_params = {
+                    "apiKey": self.polygon_key,
+                    "limit": 1
+                }
+                
+                success, financials = await self._make_api_call("polygon", financials_url, financials_params)
+                
+                if success and 'results' in financials and len(financials['results']) > 0:
+                    financial_data = financials['results'][0]
+                    df['pe_ratio'] = financial_data.get('peRatio', np.nan)
+                    df['dividend_yield'] = financial_data.get('dividendYield', 0)
+                    
+            return df
+            
+        except Exception as e:
+            self.logger.warning(f"Error in Polygon fetch for {ticker}: {str(e)}")
+            return pd.DataFrame()
+    
+    @st.cache_data(ttl=3600)
+    def get_fundamentals(_self, tickers: List[str]) -> pd.DataFrame:
+        """Get fundamental data for multiple tickers using the async implementation"""
+        return _self._run_sync(_self._get_fundamentals_async(tickers))
+        
+    async def _get_fundamentals_async(self, tickers: List[str]) -> pd.DataFrame:
+        """Get fundamental data for multiple tickers"""
+        fundamentals = []
+        
+        # Add progress indicator for user feedback
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        st.info("💡 Note: We're fetching data in parallel with rate limiting. This may take a moment...")
+        
+        # Use semaphore to limit concurrent requests
+        semaphore = asyncio.Semaphore(3)  # Max 3 concurrent requests
+        
+        async def fetch_fundamentals_for_ticker(ticker, index):
+            """Fetch fundamentals for a single ticker with semaphore"""
+            async with semaphore:
+                status_text.text(f"Fetching data for {ticker}... ({index+1}/{len(tickers)})")
+                
+                try:
+                    # Try multiple data sources in order
+                    for source in self.data_sources:
+                        fund_data = None
+                        
+                        if source == "yahoo":
+                            fund_data = await self._get_yahoo_fundamentals(ticker)
+                        elif source == "alpha_vantage" and self.alpha_vantage_key:
+                            fund_data = await self._get_alpha_vantage_fundamentals(ticker)
+                        elif source == "finnhub" and self.finnhub_key:
+                            fund_data = await self._get_finnhub_fundamentals(ticker)
+                        elif source == "fmp" and self.fmp_key:
+                            fund_data = await self._get_fmp_fundamentals(ticker)
+                        elif source == "polygon" and self.polygon_key:
+                            fund_data = await self._get_polygon_fundamentals(ticker)
+                        else:
+                            continue
+                            
+                        if fund_data:  # If we got valid data
+                            status_text.text(f"✓ Got data for {ticker} from {source}")
+                            return fund_data
+                    
+                    # If all sources failed, return basic data
+                    self.logger.warning(f"All sources failed for {ticker} fundamentals")
+                    return {
+                        'ticker': ticker,
+                        'name': ticker,
+                        'current_price': 0,
+                        'market_cap': 0,
+                        'pe_ratio': np.nan,
+                        'pb_ratio': np.nan,
+                        'ps_ratio': np.nan,
+                        'ev_ebitda': np.nan,
+                        'profit_margin': np.nan,
+                        'roe': np.nan,
+                        'debt_to_equity': np.nan,
+                        'current_ratio': np.nan,
+                        'revenue': 0,
+                        'revenue_growth': np.nan,
+                        'eps_growth': np.nan,
+                        'dividend_yield': 0,
+                        'payout_ratio': np.nan,
+                        'beta': np.nan,
+                        'sector': 'Unknown',
+                        'industry': 'Unknown'
+                    }
+                    
+                except Exception as e:
+                    self.logger.error(f"Error fetching fundamentals for {ticker}: {str(e)}")
+                    return {
+                        'ticker': ticker,
+                        'name': ticker,
+                        'current_price': 0,
+                    }
+        
+        # Create and run tasks for all tickers
+        tasks = [fetch_fundamentals_for_ticker(ticker, i) for i, ticker in enumerate(tickers)]
+        results = await asyncio.gather(*tasks)
+        
+        # Process results
+        for i, result in enumerate(results):
+            if result:  # If we got valid data
+                fundamentals.append(result)
+                
+            # Update progress
+            progress_bar.progress((i + 1) / len(tickers))
+            
+        # Clear progress indicators
+        progress_bar.empty()
+        status_text.empty()
+        
+        # Create DataFrame even if some stocks failed
+        if fundamentals:
+            df = pd.DataFrame(fundamentals)
+            # Only set ticker as index if it exists
+            if 'ticker' in df.columns:
+                df = df.set_index('ticker')
+            return df
+        else:
+            # Return empty DataFrame with expected columns if all requests failed
+            columns = ['name', 'market_cap', 'pe_ratio', 'pb_ratio', 'ps_ratio', 'ev_ebitda', 
+                      'profit_margin', 'roe', 'debt_to_equity', 'current_ratio', 'revenue', 
+                      'revenue_growth', 'eps_growth', 'dividend_yield', 'payout_ratio', 'beta', 
+                      'sector', 'industry', 'current_price']
+            return pd.DataFrame(columns=columns)
+            
+    async def _get_yahoo_fundamentals(self, ticker: str) -> Dict:
+        """Get fundamental data from Yahoo Finance"""
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as pool:
+            try:
+                # Apply rate limiting
+                await asyncio.sleep(self._get_api_call_delay("yahoo"))
+                
+                def _fetch():
+                    stock = yf.Ticker(ticker)
+                    
+                    # Try to get basic info first
+                    hist = stock.history(period="1d")
+                    if hist.empty:
+                        return None
+                        
+                    current_price = hist['Close'].iloc[-1] if not hist.empty else 0
+                    
+                    # Try to get fundamental info with retry
+                    for attempt in range(3):
+                        try:
+                            time.sleep(1 + attempt)  # Increasing delay
+                            info = stock.info
+                            
+                            if not info or len(info) <= 1:
+                                raise Exception("Empty info received")
+                                
+                            # Extract fundamental data
+                            return {
+                                'ticker': ticker,
+                                'name': info.get('longName', info.get('shortName', ticker)),
+                                'market_cap': info.get('marketCap', 0),
+                                'pe_ratio': info.get('trailingPE', np.nan),
+                                'pb_ratio': info.get('priceToBook', np.nan),
+                                'ps_ratio': info.get('priceToSalesTrailing12Months', np.nan),
+                                'ev_ebitda': info.get('enterpriseToEbitda', np.nan),
+                                'profit_margin': info.get('profitMargins', np.nan),
+                                'roe': info.get('returnOnEquity', np.nan),
+                                'debt_to_equity': info.get('debtToEquity', np.nan),
+                                'current_ratio': info.get('currentRatio', np.nan),
+                                'revenue': info.get('totalRevenue', 0),
+                                'revenue_growth': info.get('revenueGrowth', np.nan),
+                                'eps_growth': info.get('earningsGrowth', np.nan),
+                                'dividend_yield': info.get('dividendYield', 0),
+                                'payout_ratio': info.get('payoutRatio', np.nan),
+                                'beta': info.get('beta', np.nan),
+                                'sector': info.get('sector', 'Unknown'),
+                                'industry': info.get('industry', 'Unknown'),
+                                'current_price': info.get('currentPrice', current_price)
+                            }
+                        except Exception as e:
+                            if attempt == 2:  # Last attempt
+                                return {
+                                    'ticker': ticker,
+                                    'name': ticker,
+                                    'current_price': current_price,
+                                    'market_cap': 0,
+                                }
+                    
+                return await loop.run_in_executor(pool, _fetch)
+            except Exception as e:
+                self.logger.warning(f"Error in Yahoo fundamentals for {ticker}: {str(e)}")
+                return None
+                
+    async def _get_alpha_vantage_fundamentals(self, ticker: str) -> Dict:
+        """Get fundamental data from Alpha Vantage"""
+        try:
+            # Get company overview
+            base_url = "https://www.alphavantage.co/query"
+            params = {
+                "function": "OVERVIEW",
+                "symbol": ticker,
+                "apikey": self.alpha_vantage_key
+            }
+            
+            success, data = await self._make_api_call("alpha_vantage", base_url, params)
+            
+            if not success or not data:
+                return None
+                
+            # Get current price
+            quote_params = {
+                "function": "GLOBAL_QUOTE",
+                "symbol": ticker,
+                "apikey": self.alpha_vantage_key
+            }
+            
+            success, quote = await self._make_api_call("alpha_vantage", base_url, quote_params)
+            current_price = float(quote.get("Global Quote", {}).get("05. price", 0)) if success and quote else 0
+            
+            # Extract fundamental data
+            return {
+                'ticker': ticker,
+                'name': data.get('Name', ticker),
+                'market_cap': float(data.get('MarketCapitalization', 0)),
+                'pe_ratio': float(data.get('PERatio', np.nan)),
+                'pb_ratio': float(data.get('PriceToBookRatio', np.nan)),
+                'ps_ratio': float(data.get('PriceToSalesRatioTTM', np.nan)),
+                'ev_ebitda': float(data.get('EVToEBITDA', np.nan)),
+                'profit_margin': float(data.get('ProfitMargin', np.nan)),
+                'roe': float(data.get('ReturnOnEquityTTM', np.nan)),
+                'debt_to_equity': float(data.get('DebtToEquity', np.nan)),
+                'current_ratio': float(data.get('CurrentRatio', np.nan)),
+                'revenue': float(data.get('RevenueTTM', 0)),
+                'revenue_growth': float(data.get('QuarterlyRevenueGrowthYOY', np.nan)),
+                'eps_growth': float(data.get('QuarterlyEarningsGrowthYOY', np.nan)),
+                'dividend_yield': float(data.get('DividendYield', 0)),
+                'payout_ratio': float(data.get('PayoutRatio', np.nan)),
+                'beta': float(data.get('Beta', np.nan)),
+                'sector': data.get('Sector', 'Unknown'),
+                'industry': data.get('Industry', 'Unknown'),
+                'current_price': current_price
+            }
+            
+        except Exception as e:
+            self.logger.warning(f"Error in Alpha Vantage fundamentals for {ticker}: {str(e)}")
+            return None
+            
+    async def _get_finnhub_fundamentals(self, ticker: str) -> Dict:
+        """Get fundamental data from Finnhub"""
+        try:
+            # Get company profile
+            profile_url = "https://finnhub.io/api/v1/stock/profile2"
+            profile_params = {
+                "symbol": ticker,
+                "token": self.finnhub_key
+            }
+            
+            success, profile = await self._make_api_call("finnhub", profile_url, profile_params)
+            
+            if not success or not profile:
+                return None
+                
+            # Get quote for current price
+            quote_url = "https://finnhub.io/api/v1/quote"
+            quote_params = {
+                "symbol": ticker,
+                "token": self.finnhub_key
+            }
+            
+            success, quote = await self._make_api_call("finnhub", quote_url, quote_params)
+            current_price = quote.get('c', 0) if success and quote else 0
+            
+            # Get metrics
+            metrics_url = "https://finnhub.io/api/v1/stock/metric"
+            metrics_params = {
+                "symbol": ticker,
+                "metric": "all",
+                "token": self.finnhub_key
+            }
+            
+            success, metrics = await self._make_api_call("finnhub", metrics_url, metrics_params)
+            metrics_data = metrics.get('metric', {}) if success and metrics else {}
+            
+            # Extract data
+            return {
+                'ticker': ticker,
+                'name': profile.get('name', ticker),
+                'market_cap': profile.get('marketCapitalization', 0) * 1e6,  # Convert from millions
+                'pe_ratio': metrics_data.get('peBasicExclExtraTTM', np.nan),
+                'pb_ratio': metrics_data.get('pbAnnual', np.nan),
+                'ps_ratio': metrics_data.get('psTTM', np.nan),
+                'ev_ebitda': metrics_data.get('enterpriseValueOverEBITDATTM', np.nan),
+                'profit_margin': metrics_data.get('netProfitMarginTTM', np.nan),
+                'roe': metrics_data.get('roeTTM', np.nan),
+                'debt_to_equity': metrics_data.get('totalDebtToEquityQuarterly', np.nan),
+                'current_ratio': metrics_data.get('currentRatioQuarterly', np.nan),
+                'revenue': metrics_data.get('revenueTTM', 0),
+                'revenue_growth': metrics_data.get('revenueGrowthQuarterlyYoy', np.nan),
+                'eps_growth': metrics_data.get('epsGrowthQuarterlyYoy', np.nan),
+                'dividend_yield': metrics_data.get('dividendYieldIndicatedAnnual', 0) / 100,  # Convert from percentage
+                'payout_ratio': metrics_data.get('payoutRatioTTM', np.nan),
+                'beta': profile.get('beta', np.nan),
+                'sector': profile.get('finnhubIndustry', 'Unknown'),  # Finnhub uses different terminology
+                'industry': profile.get('finnhubIndustry', 'Unknown'),
+                'current_price': current_price
+            }
+            
+        except Exception as e:
+            self.logger.warning(f"Error in Finnhub fundamentals for {ticker}: {str(e)}")
+            return None
+            
+    async def _get_fmp_fundamentals(self, ticker: str) -> Dict:
+        """Get fundamental data from Financial Modeling Prep"""
+        try:
+            # Get company profile
+            profile_url = "https://financialmodelingprep.com/api/v3/profile"
+            profile_params = {
+                "symbol": ticker,
+                "apikey": self.fmp_key
+            }
+            
+            success, profiles = await self._make_api_call("fmp", profile_url, profile_params)
+            
+            if not success or not profiles or len(profiles) == 0:
+                return None
+                
+            profile = profiles[0]
+            
+            # Get key metrics
+            metrics_url = "https://financialmodelingprep.com/api/v3/key-metrics-ttm"
+            metrics_params = {
+                "symbol": ticker,
+                "apikey": self.fmp_key
+            }
+            
+            success, metrics = await self._make_api_call("fmp", metrics_url, metrics_params)
+            metrics_data = metrics[0] if success and metrics and len(metrics) > 0 else {}
+            
+            # Get financial growth
+            growth_url = "https://financialmodelingprep.com/api/v3/financial-growth"
+            growth_params = {
+                "symbol": ticker,
+                "limit": 1,
+                "apikey": self.fmp_key
+            }
+            
+            success, growth = await self._make_api_call("fmp", growth_url, growth_params)
+            growth_data = growth[0] if success and growth and len(growth) > 0 else {}
+            
+            # Extract data
+            return {
+                'ticker': ticker,
+                'name': profile.get('companyName', ticker),
+                'market_cap': profile.get('mktCap', 0),
+                'pe_ratio': profile.get('pe', np.nan),
+                'pb_ratio': metrics_data.get('pbRatioTTM', np.nan),
+                'ps_ratio': metrics_data.get('priceToSalesRatioTTM', np.nan),
+                'ev_ebitda': metrics_data.get('enterpriseValueOverEBITDATTM', np.nan),
+                'profit_margin': metrics_data.get('netProfitMarginTTM', np.nan),
+                'roe': metrics_data.get('roeTTM', np.nan),
+                'debt_to_equity': metrics_data.get('debtToEquityTTM', np.nan),
+                'current_ratio': metrics_data.get('currentRatioTTM', np.nan),
+                'revenue': metrics_data.get('revenueTTM', 0),
+                'revenue_growth': growth_data.get('revenueGrowth', np.nan),
+                'eps_growth': growth_data.get('epsgrowth', np.nan),
+                'dividend_yield': profile.get('lastDiv', 0) / profile.get('price', 1) if profile.get('price', 0) > 0 else 0,
+                'payout_ratio': metrics_data.get('payoutRatioTTM', np.nan),
+                'beta': profile.get('beta', np.nan),
+                'sector': profile.get('sector', 'Unknown'),
+                'industry': profile.get('industry', 'Unknown'),
+                'current_price': profile.get('price', 0)
+            }
+            
+        except Exception as e:
+            self.logger.warning(f"Error in FMP fundamentals for {ticker}: {str(e)}")
+            return None
+            
+    async def _get_polygon_fundamentals(self, ticker: str) -> Dict:
+        """Get fundamental data from Polygon.io"""
+        try:
+            # Get ticker details
+            details_url = f"https://api.polygon.io/v3/reference/tickers/{ticker}"
+            details_params = {
+                "apiKey": self.polygon_key
+            }
+            
+            success, details = await self._make_api_call("polygon", details_url, details_params)
+            
+            if not success or 'results' not in details:
+                return None
+                
+            ticker_data = details['results']
+            
+            # Get current price
+            quote_url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}"
+            quote_params = {
+                "apiKey": self.polygon_key
+            }
+            
+            success, quote = await self._make_api_call("polygon", quote_url, quote_params)
+            current_price = quote.get('ticker', {}).get('lastQuote', {}).get('p', 0) if success and quote else 0
+            
+            # Get financials
+            financials_url = f"https://api.polygon.io/v2/reference/financials/{ticker}"
+            financials_params = {
+                "apiKey": self.polygon_key,
+                "limit": 1
+            }
+            
+            success, financials = await self._make_api_call("polygon", financials_url, financials_params)
+            financial_data = financials.get('results', [{}])[0] if success and financials and 'results' in financials else {}
+            
+            # Extract data
+            return {
+                'ticker': ticker,
+                'name': ticker_data.get('name', ticker),
+                'market_cap': ticker_data.get('market_cap', 0),
+                'pe_ratio': financial_data.get('ratios', {}).get('peRatio', np.nan),
+                'pb_ratio': financial_data.get('ratios', {}).get('pbRatio', np.nan),
+                'ps_ratio': financial_data.get('ratios', {}).get('priceToSalesRatio', np.nan),
+                'ev_ebitda': financial_data.get('ratios', {}).get('evToEbitda', np.nan),
+                'profit_margin': financial_data.get('ratios', {}).get('profitMargin', np.nan),
+                'roe': financial_data.get('ratios', {}).get('roe', np.nan),
+                'debt_to_equity': financial_data.get('ratios', {}).get('debtToEquity', np.nan),
+                'current_ratio': financial_data.get('ratios', {}).get('currentRatio', np.nan),
+                'revenue': financial_data.get('revenue', 0),
+                'revenue_growth': financial_data.get('revenueDelta', np.nan),
+                'eps_growth': financial_data.get('epsDelta', np.nan),
+                'dividend_yield': financial_data.get('dividendYield', 0),
+                'payout_ratio': financial_data.get('payoutRatio', np.nan),
+                'beta': ticker_data.get('beta', np.nan),
+                'sector': ticker_data.get('sic_description', 'Unknown'),
+                'industry': ticker_data.get('sic_description', 'Unknown'),
+                'current_price': current_price
+            }
+            
+        except Exception as e:
+            self.logger.warning(f"Error in Polygon fundamentals for {ticker}: {str(e)}")
+            return None
+    
+    def run_screening(self, config) -> pd.DataFrame:
+        """Run the complete screening process"""
+        return self._run_sync(self._run_screening_async(config))
+        
+    async def _run_screening_async(self, config) -> pd.DataFrame:
+        """Run the complete screening process asynchronously"""
+        # Show progress
+        st.info("🔄 Starting analysis... This may take a moment due to rate limits.")
+        
+        # Execute both data fetching operations concurrently
+        price_data_task = self._fetch_stock_data_async(config.tickers, config.get_yfinance_period())
+        fundamentals_task = self._get_fundamentals_async(config.tickers)
+        
+        # Wait for both to complete
+        price_data, fundamentals = await asyncio.gather(
+            price_data_task,
+            fundamentals_task
+        )
+        
+        # Check if we got any data
+        if fundamentals.empty:
+            st.error("Unable to fetch fundamental data for any stocks. This might be due to rate limiting. Please try again in a few minutes with fewer stocks.")
+            return pd.DataFrame()
+        
+        # Apply filters
+        fundamentals = self._apply_filters(fundamentals, config)
+        
+        if fundamentals.empty:
+            st.warning("No stocks passed the filtering criteria.")
+            return pd.DataFrame()
+        
+        # Calculate strategy scores
+        strategy_scores = {}
+        
+        if "Momentum" in config.strategies:
+            strategy_scores['momentum_score'] = self.calculate_momentum_scores(price_data)
+        
+        if "Value" in config.strategies:
+            strategy_scores['value_score'] = self.calculate_value_scores(fundamentals)
+        
+        if "Growth" in config.strategies:
+            strategy_scores['growth_score'] = self.calculate_growth_scores(fundamentals)
+        
+        if "Quality" in config.strategies:
+            strategy_scores['quality_score'] = self.calculate_quality_scores(fundamentals)
+        
+        if "Income" in config.strategies:
+            strategy_scores['income_score'] = self.calculate_income_scores(fundamentals)
+        
+        if "Low Volatility" in config.strategies:
+            strategy_scores['volatility_score'] = self.calculate_volatility_scores(price_data)
+        
+        # Combine scores
+        results = fundamentals.copy()
+        
+        for strategy, scores in strategy_scores.items():
+            results[strategy] = scores.reindex(results.index, fill_value=0)
+        
+        # Calculate composite score
+        if results.empty:
+            st.warning("No stocks available for scoring.")
+            return pd.DataFrame()
+        
+        results['composite_score'] = self._calculate_composite_score(results, config)
+        
+        # Add additional metrics
+        results['volatility'] = self._calculate_volatility(price_data)
+        
+        # Sort by composite score
+        results = results.sort_values('composite_score', ascending=False)
+        
+        st.success(f"✅ Analysis complete! Successfully analyzed {len(results)} stocks.")
+        
+        return results
+    
+    def calculate_momentum_scores(self, price_data: Dict[str, pd.DataFrame]) -> pd.Series:
+        """Calculate momentum scores for stocks using vectorized operations"""
+        scores = {}
+        
+        # Pre-calculate return periods
+        periods = {
+            '1m': 21,   # ~1 month of trading days
+            '3m': 63,   # ~3 months of trading days
+            '6m': 126,  # ~6 months of trading days
+            '12m': 252  # ~12 months of trading days
+        }
+        
+        # Weights for different time periods
+        weights = {'1m': 0.1, '3m': 0.2, '6m': 0.3, '12m': 0.4}
+        
+        for ticker, df in price_data.items():
+            if df.empty:
+                scores[ticker] = 0
+                continue
+            
+            try:
+                # Calculate all returns at once with vectorized operations
+                returns = {}
+                current_price = df['Close'].iloc[-1]
+                
+                for period_name, days in periods.items():
+                    if len(df) >= days:
+                        returns[period_name] = ((current_price / df['Close'].iloc[-days]) - 1) * 100
+                    else:
+                        returns[period_name] = 0
+                
+                # Moving averages (vectorized)
+                sma_50 = df['Close'].rolling(50).mean().iloc[-1] if len(df) >= 50 else current_price
+                sma_200 = df['Close'].rolling(200).mean().iloc[-1] if len(df) >= 200 else current_price
+                
+                # Calculate weighted momentum score
+                momentum_score = sum(returns[period] * weights[period] for period in returns)
+                
+                # Adjust for moving average position
+                if current_price > sma_50 > sma_200:
+                    momentum_score *= 1.1  # Bonus for bullish trend
+                elif current_price < sma_50 < sma_200:
+                    momentum_score *= 0.9  # Penalty for bearish trend
+                
+                # Normalize to 0-100 scale
+                scores[ticker] = max(0, min(100, 50 + momentum_score))
+                
+            except Exception as e:
+                self.logger.warning(f"Error calculating momentum for {ticker}: {str(e)}")
+                scores[ticker] = 0
+        
+        return pd.Series(scores)
+    
+    def calculate_value_scores(self, fundamentals: pd.DataFrame) -> pd.Series:
+        """Calculate value scores for stocks"""
+        scores = {}
+        
+        for ticker, row in fundamentals.iterrows():
+            try:
+                score = 0
+                
+                # P/E ratio scoring (lower is better)
+                if pd.notna(row['pe_ratio']) and row['pe_ratio'] > 0:
+                    if row['pe_ratio'] < 15:
+                        score += 30
+                    elif row['pe_ratio'] < 20:
+                        score += 20
+                    elif row['pe_ratio'] < 30:
+                        score += 10
+                
+                # P/B ratio scoring
+                if pd.notna(row['pb_ratio']) and row['pb_ratio'] > 0:
+                    if row['pb_ratio'] < 1.5:
+                        score += 25
+                    elif row['pb_ratio'] < 2.5:
+                        score += 15
+                    elif row['pb_ratio'] < 3.5:
+                        score += 5
+                
+                # EV/EBITDA scoring
+                if pd.notna(row['ev_ebitda']) and row['ev_ebitda'] > 0:
+                    if row['ev_ebitda'] < 10:
+                        score += 25
+                    elif row['ev_ebitda'] < 15:
+                        score += 15
+                    elif row['ev_ebitda'] < 20:
+                        score += 5
+                
+                # Dividend yield bonus
+                if row['dividend_yield'] > 0.02:  # 2% yield
+                    score += 20
+                
+                scores[ticker] = min(100, score)
+                
+            except Exception as e:
+                scores[ticker] = 0
+        
+        return pd.Series(scores)
+    
+    def calculate_growth_scores(self, fundamentals: pd.DataFrame) -> pd.Series:
+        """Calculate growth scores for stocks"""
+        scores = {}
+        
+        for ticker, row in fundamentals.iterrows():
+            try:
+                score = 0
+                
+                # Revenue growth scoring
+                if pd.notna(row['revenue_growth']):
+                    revenue_growth = row['revenue_growth'] * 100
+                    if revenue_growth > 15:
+                        score += 40
+                    elif revenue_growth > 10:
+                        score += 30
+                    elif revenue_growth > 5:
+                        score += 20
+                    elif revenue_growth > 0:
+                        score += 10
+                
+                # EPS growth scoring
+                if pd.notna(row['eps_growth']):
+                    eps_growth = row['eps_growth'] * 100
+                    if eps_growth > 20:
+                        score += 40
+                    elif eps_growth > 15:
+                        score += 30
+                    elif eps_growth > 10:
+                        score += 20
+                    elif eps_growth > 0:
+                        score += 10
+                
+                # Profit margin quality
+                if pd.notna(row['profit_margin']):
+                    profit_margin = row['profit_margin'] * 100
+                    if profit_margin > 20:
+                        score += 20
+                    elif profit_margin > 10:
+                        score += 10
+                
+                scores[ticker] = min(100, score)
+                
+            except Exception as e:
+                scores[ticker] = 0
+        
+        return pd.Series(scores)
+    
+    def calculate_quality_scores(self, fundamentals: pd.DataFrame) -> pd.Series:
+        """Calculate quality scores for stocks"""
+        scores = {}
+        
+        for ticker, row in fundamentals.iterrows():
+            try:
+                score = 0
+                
+                # ROE scoring
+                if pd.notna(row['roe']):
+                    roe = row['roe'] * 100
+                    if roe > 20:
+                        score += 30
+                    elif roe > 15:
+                        score += 20
+                    elif roe > 10:
+                        score += 10
+                
+                # Debt to equity ratio
+                if pd.notna(row['debt_to_equity']):
+                    if row['debt_to_equity'] < 0.5:
+                        score += 25
+                    elif row['debt_to_equity'] < 1.0:
+                        score += 15
+                    elif row['debt_to_equity'] < 2.0:
+                        score += 5
+                
+                # Current ratio
+                if pd.notna(row['current_ratio']):
+                    if row['current_ratio'] > 2.0:
+                        score += 25
+                    elif row['current_ratio'] > 1.5:
+                        score += 15
+                    elif row['current_ratio'] > 1.0:
+                        score += 5
+                
+                # Profit margins
+                if pd.notna(row['profit_margin']):
+                    profit_margin = row['profit_margin'] * 100
+                    if profit_margin > 15:
+                        score += 20
+                    elif profit_margin > 10:
+                        score += 10
+                    elif profit_margin > 5:
+                        score += 5
+                
+                scores[ticker] = min(100, score)
+                
+            except Exception as e:
+                scores[ticker] = 0
+        
+        return pd.Series(scores)
+    
+    def calculate_income_scores(self, fundamentals: pd.DataFrame) -> pd.Series:
+        """Calculate income/dividend scores for stocks"""
+        scores = {}
+        
+        for ticker, row in fundamentals.iterrows():
+            try:
+                score = 0
+                
+                # Dividend yield scoring
+                if row['dividend_yield'] > 0:
+                    yield_pct = row['dividend_yield'] * 100
+                    if yield_pct > 4:
+                        score += 50
+                    elif yield_pct > 3:
+                        score += 40
+                    elif yield_pct > 2:
+                        score += 30
+                    elif yield_pct > 1:
+                        score += 20
+                    elif yield_pct > 0:
+                        score += 10
+                
+                # Payout ratio (sustainability check)
+                if pd.notna(row['payout_ratio']):
+                    if 0.3 < row['payout_ratio'] < 0.6:  # Sweet spot
+                        score += 30
+                    elif 0.2 < row['payout_ratio'] < 0.8:  # Acceptable
+                        score += 20
+                    elif row['payout_ratio'] < 0.2:  # Conservative
+                        score += 10
+                
+                # Dividend growth proxy (based on revenue and earnings growth)
+                if pd.notna(row['revenue_growth']) and row['revenue_growth'] > 0.05:
+                    score += 20
+                
+                scores[ticker] = min(100, score)
+                
+            except Exception as e:
+                scores[ticker] = 0
+        
+        return pd.Series(scores)
+    
+    def calculate_volatility_scores(self, price_data: Dict[str, pd.DataFrame]) -> pd.Series:
+        """Calculate low volatility scores for stocks"""
+        scores = {}
+        
+        for ticker, df in price_data.items():
+            if df.empty:
+                scores[ticker] = 0
+                continue
+            
+            try:
+                # Calculate returns
+                returns = df['Close'].pct_change()
+                
+                # Standard deviation of returns (lower is better)
+                volatility = returns.std() * np.sqrt(252)  # Annualized
+                
+                # Beta (lower is better for low-vol strategy)
+                beta = df['beta'].iloc[-1] if 'beta' in df and pd.notna(df['beta'].iloc[-1]) else 1.0
+                
+                # Assign scores
+                vol_score = 0
+                if volatility < 0.15:  # Less than 15% annual volatility
+                    vol_score += 50
+                elif volatility < 0.20:
+                    vol_score += 40
+                elif volatility < 0.25:
+                    vol_score += 30
+                elif volatility < 0.30:
+                    vol_score += 20
+                
+                # Beta scoring
+                beta_score = 0
+                if beta < 0.8:
+                    beta_score += 40
+                elif beta < 1.0:
+                    beta_score += 30
+                elif beta < 1.2:
+                    beta_score += 20
+                
+                # Downside deviation (only count negative returns)
+                downside_returns = returns[returns < 0]
+                downside_deviation = downside_returns.std() * np.sqrt(252)
+                
+                downside_score = 0
+                if downside_deviation < 0.10:
+                    downside_score += 10
+                elif downside_deviation < 0.15:
+                    downside_score += 5
+                
+                scores[ticker] = min(100, vol_score + beta_score + downside_score)
+                
+            except Exception as e:
+                scores[ticker] = 0
+        
+        return pd.Series(scores)
+    
+    def _apply_filters(self, df: pd.DataFrame, config) -> pd.DataFrame:
+        """Apply filtering criteria"""
+        # Market cap filter
+        df = df[df['market_cap'] >= config.min_market_cap * 1e6]
+        
+        # Sector exclusions
+        if config.exclude_sectors:
+            df = df[~df['sector'].isin(config.exclude_sectors)]
+        
+        return df
+    
+    def _calculate_composite_score(self, df: pd.DataFrame, config) -> pd.Series:
+        """Calculate composite score based on selected strategies and weights"""
+        
+        def _get_score_col(strategy_name: str) -> str:
+            """Map strategy display name to its DataFrame column name."""
+            return STRATEGY_SCORE_COLUMNS.get(strategy_name, f"{strategy_name.lower()}_score")
+        
+        if config.scoring_method == "Rank Aggregation":
+            ranks = pd.DataFrame()
+            
+            for strategy in config.strategies:
+                score_column = _get_score_col(strategy)
+                if score_column in df:
+                    ranks[strategy] = df[score_column].rank(ascending=False)
+            
+            if hasattr(config, 'custom_weights') and config.custom_weights:
+                for strategy in config.strategies:
+                    if strategy in config.custom_weights:
+                        ranks[strategy] = ranks[strategy] * config.custom_weights[strategy]
+            
+            total_ranks = ranks.sum(axis=1)
+            if len(total_ranks) > 1 and total_ranks.max() > total_ranks.min():
+                composite = 100 - (total_ranks - total_ranks.min()) / (total_ranks.max() - total_ranks.min()) * 100
+            else:
+                composite = pd.Series(50, index=total_ranks.index)
+            
+        elif config.scoring_method == "Percentile Scoring":
+            scores = pd.DataFrame()
+            
+            for strategy in config.strategies:
+                score_column = _get_score_col(strategy)
+                if score_column in df:
+                    scores[strategy] = df[score_column].rank(pct=True) * 100
+            
+            if hasattr(config, 'custom_weights') and config.custom_weights:
+                for strategy in config.strategies:
+                    if strategy in config.custom_weights:
+                        weight = config.custom_weights.get(strategy, 1.0) 
+                        scores[strategy] = scores[strategy] * weight
+                        
+                total_weight = sum(config.custom_weights.get(strategy, 1.0) for strategy in config.strategies)
+                if total_weight > 0:
+                    scores = scores / total_weight * len(config.strategies)
+                    
+            composite = scores.mean(axis=1)
+            
+        else:  # Custom weights
+            scores = pd.DataFrame()
+            default_weight = 1.0 / len(config.strategies)
+            
+            for strategy in config.strategies:
+                score_column = _get_score_col(strategy)
+                if score_column in df:
+                    weight = config.custom_weights.get(strategy, default_weight) if hasattr(config, 'custom_weights') else default_weight
+                    scores[strategy] = df[score_column] * weight
+            
+            composite = scores.sum(axis=1)
+            
+            if composite.max() > 100:
+                composite = composite / composite.max() * 100
+        
+        return composite
+    
+    def _calculate_volatility(self, price_data: Dict[str, pd.DataFrame]) -> pd.Series:
+        """Calculate annualized volatility for each stock"""
+        volatilities = {}
+        
+        for ticker, df in price_data.items():
+            if df.empty:
+                volatilities[ticker] = np.nan
+                continue
+            
+            returns = df['Close'].pct_change()
+            volatility = returns.std() * np.sqrt(252)  # Annualized
+            volatilities[ticker] = volatility
+        
+        return pd.Series(volatilities)
