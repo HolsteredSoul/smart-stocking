@@ -751,7 +751,9 @@ class DataService:
                         'payout_ratio': np.nan,
                         'beta': np.nan,
                         'sector': 'Unknown',
-                        'industry': 'Unknown'
+                        'industry': 'Unknown',
+                        'dividend_consistent': False,
+                        'dividend_growing': False,
                     }
                     
                 except Exception as e:
@@ -820,6 +822,25 @@ class DataService:
                             if not info or len(info) <= 1:
                                 raise Exception("Empty info received")
                                 
+                            # Dividend history signals (actual payment track record)
+                            dividend_consistent = False
+                            dividend_growing = False
+                            try:
+                                divs = stock.dividends
+                                if not divs.empty:
+                                    tz = divs.index.tz
+                                    now = pd.Timestamp.now(tz=tz)
+                                    two_yrs_ago = now - pd.DateOffset(years=2)
+                                    one_yr_ago = now - pd.DateOffset(years=1)
+                                    recent = divs[divs.index >= two_yrs_ago]
+                                    dividend_consistent = len(recent) >= 4
+                                    curr_yr = divs[divs.index >= one_yr_ago]
+                                    prev_yr = divs[(divs.index >= two_yrs_ago) & (divs.index < one_yr_ago)]
+                                    if not curr_yr.empty and not prev_yr.empty:
+                                        dividend_growing = float(curr_yr.sum()) >= float(prev_yr.sum())
+                            except Exception:
+                                pass
+
                             # Extract fundamental data
                             return {
                                 'ticker': ticker,
@@ -841,7 +862,9 @@ class DataService:
                                 'beta': info.get('beta', np.nan),
                                 'sector': info.get('sector', 'Unknown'),
                                 'industry': info.get('industry', 'Unknown'),
-                                'current_price': info.get('currentPrice', current_price)
+                                'current_price': info.get('currentPrice', current_price),
+                                'dividend_consistent': dividend_consistent,
+                                'dividend_growing': dividend_growing,
                             }
                         except Exception as e:
                             if attempt == 2:  # Last attempt
@@ -1688,9 +1711,16 @@ class DataService:
                     elif row['payout_ratio'] < 0.2:  # Conservative
                         score += 10
                 
-                # Dividend growth proxy (based on revenue and earnings growth)
-                if pd.notna(row['revenue_growth']) and row['revenue_growth'] > 0.05:
-                    score += 20
+                # Dividend history (actual track record — replaces revenue-growth proxy)
+                div_consistent = row.get('dividend_consistent', False)
+                div_growing = row.get('dividend_growing', False)
+                if div_consistent:
+                    score += 10  # paid at least quarterly for 2 years
+                if div_growing:
+                    score += 10  # dividend amount grew year-over-year
+                elif not div_consistent and pd.notna(row.get('revenue_growth')) and row['revenue_growth'] > 0.05:
+                    # Fallback proxy for stocks without dividend history data
+                    score += 5
                 
                 scores[ticker] = min(100, score)
                 
