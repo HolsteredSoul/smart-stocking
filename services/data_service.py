@@ -1411,59 +1411,125 @@ class DataService:
         return pd.Series(scores)
     
     def calculate_value_scores(self, fundamentals: pd.DataFrame) -> pd.Series:
-        """Calculate value scores for stocks"""
+        """Calculate value scores for stocks, normalised relative to sector peers.
+
+        For each valuation metric (P/E, P/B, EV/EBITDA, P/S) the stock is scored
+        against the median of stocks in the same sector within the screened set.
+        If fewer than 3 peers share the same sector the absolute thresholds are used
+        as a fallback so thinly-represented sectors still receive meaningful scores.
+        """
         scores = {}
-        
+
+        # --- Pre-compute sector medians across the screened universe ---
+        METRICS = ['pe_ratio', 'pb_ratio', 'ev_ebitda', 'ps_ratio']
+        sector_col = 'sector' if 'sector' in fundamentals.columns else None
+        sector_medians: Dict[str, Dict[str, float]] = {}
+
+        if sector_col:
+            for sector, group in fundamentals.groupby(sector_col):
+                medians = {}
+                for m in METRICS:
+                    if m in group.columns:
+                        valid = group[m].dropna()
+                        valid = valid[valid > 0]
+                        if len(valid) >= 3:
+                            medians[m] = float(valid.median())
+                sector_medians[sector] = medians
+
+        def _relative_score(value: float, sector_median: float,
+                            low_mult: float, mid_mult: float, high_mult: float,
+                            pts_max: int, pts_mid: int, pts_low: int) -> int:
+            """Score a metric relative to its sector median.
+
+            Ratios < low_mult × median  → pts_max
+            Ratios < mid_mult × median  → pts_mid
+            Ratios < high_mult × median → pts_low
+            Else → 0
+            """
+            ratio = value / sector_median
+            if ratio < low_mult:
+                return pts_max
+            if ratio < mid_mult:
+                return pts_mid
+            if ratio < high_mult:
+                return pts_low
+            return 0
+
+        def _absolute_pe(v: float) -> int:
+            if v < 15: return 25
+            if v < 20: return 17
+            if v < 30: return 8
+            return 0
+
+        def _absolute_pb(v: float) -> int:
+            if v < 1.5: return 20
+            if v < 2.5: return 12
+            if v < 3.5: return 4
+            return 0
+
+        def _absolute_evebitda(v: float) -> int:
+            if v < 10: return 20
+            if v < 15: return 12
+            if v < 20: return 4
+            return 0
+
+        def _absolute_ps(v: float) -> int:
+            if v < 2: return 20
+            if v < 4: return 12
+            if v < 8: return 5
+            return 0
+
         for ticker, row in fundamentals.iterrows():
             try:
                 score = 0
-                
-                # P/E ratio scoring — lower is better (max 25 pts)
-                if pd.notna(row['pe_ratio']) and row['pe_ratio'] > 0:
-                    if row['pe_ratio'] < 15:
-                        score += 25
-                    elif row['pe_ratio'] < 20:
-                        score += 17
-                    elif row['pe_ratio'] < 30:
-                        score += 8
+                sector = row.get(sector_col, '') if sector_col else ''
+                s_med = sector_medians.get(sector, {})
 
-                # P/B ratio scoring (max 20 pts)
-                if pd.notna(row['pb_ratio']) and row['pb_ratio'] > 0:
-                    if row['pb_ratio'] < 1.5:
-                        score += 20
-                    elif row['pb_ratio'] < 2.5:
-                        score += 12
-                    elif row['pb_ratio'] < 3.5:
-                        score += 4
+                # P/E ratio — lower is better (max 25 pts)
+                pe = row.get('pe_ratio')
+                if pd.notna(pe) and pe > 0:
+                    med = s_med.get('pe_ratio')
+                    if med and med > 0:
+                        score += _relative_score(pe, med, 0.7, 0.9, 1.15, 25, 17, 8)
+                    else:
+                        score += _absolute_pe(pe)
 
-                # EV/EBITDA scoring (max 20 pts)
-                if pd.notna(row['ev_ebitda']) and row['ev_ebitda'] > 0:
-                    if row['ev_ebitda'] < 10:
-                        score += 20
-                    elif row['ev_ebitda'] < 15:
-                        score += 12
-                    elif row['ev_ebitda'] < 20:
-                        score += 4
+                # P/B ratio (max 20 pts)
+                pb = row.get('pb_ratio')
+                if pd.notna(pb) and pb > 0:
+                    med = s_med.get('pb_ratio')
+                    if med and med > 0:
+                        score += _relative_score(pb, med, 0.6, 0.85, 1.10, 20, 12, 4)
+                    else:
+                        score += _absolute_pb(pb)
 
-                # P/S ratio scoring — lower is better; useful for low-earnings firms (max 20 pts)
+                # EV/EBITDA (max 20 pts)
+                ev = row.get('ev_ebitda')
+                if pd.notna(ev) and ev > 0:
+                    med = s_med.get('ev_ebitda')
+                    if med and med > 0:
+                        score += _relative_score(ev, med, 0.7, 0.9, 1.15, 20, 12, 4)
+                    else:
+                        score += _absolute_evebitda(ev)
+
+                # P/S ratio — lower is better (max 20 pts)
                 ps = row.get('ps_ratio') if 'ps_ratio' in row.index else None
                 if ps is not None and pd.notna(ps) and ps > 0:
-                    if ps < 2:
-                        score += 20
-                    elif ps < 4:
-                        score += 12
-                    elif ps < 8:
-                        score += 5
+                    med = s_med.get('ps_ratio')
+                    if med and med > 0:
+                        score += _relative_score(ps, med, 0.7, 0.9, 1.20, 20, 12, 5)
+                    else:
+                        score += _absolute_ps(ps)
 
                 # Dividend yield bonus (max 15 pts)
-                if pd.notna(row['dividend_yield']) and row['dividend_yield'] > 0.02:
+                if pd.notna(row.get('dividend_yield')) and row['dividend_yield'] > 0.02:
                     score += 15
 
                 scores[ticker] = min(100, score)
-                
-            except Exception as e:
+
+            except Exception:
                 scores[ticker] = 0
-        
+
         return pd.Series(scores)
     
     def calculate_growth_scores(self, fundamentals: pd.DataFrame) -> pd.Series:
