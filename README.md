@@ -2,7 +2,125 @@
 
 A comprehensive stock screening application built with Streamlit that implements multiple investment strategies including Momentum, Value, Growth, Quality, Income, and Low Volatility.
 
-## Features
+---
+
+## Quick Start — Run it in 5 minutes (no coding experience needed)
+
+> **What is this?** SmartStock is a personal stock research tool that runs on your computer. You type in a few stock tickers (like AAPL, MSFT, TSLA), choose what you care about (growth? income? low risk?), and it scores and ranks them for you with clear charts and plain-English explanations.
+
+### Step 1 — Check if Python is installed
+
+Open a **Terminal** (Mac) or **Command Prompt** (Windows):
+
+- **Mac**: Press `⌘ + Space`, type `Terminal`, press Enter
+- **Windows**: Press the Windows key, type `cmd`, press Enter
+
+Then type this and press Enter:
+
+```
+python --version
+```
+
+If you see something like `Python 3.10.x` or higher, you're good. If you get an error:
+
+> **Install Python**: Go to [python.org/downloads](https://www.python.org/downloads/), click the big yellow "Download Python" button, and run the installer. On Windows, **tick the "Add Python to PATH" checkbox** before clicking Install.
+
+### Step 2 — Download SmartStock
+
+**Option A — If you have Git installed:**
+
+```
+git clone https://github.com/HolsteredSoul/smart-stocking.git
+cd smart-stocking
+```
+
+**Option B — Download as a ZIP (easier for beginners):**
+
+1. Go to the GitHub page for this project
+2. Click the green **"Code"** button → **"Download ZIP"**
+3. Unzip the downloaded file to a folder you can find easily (e.g. your Desktop)
+4. In your Terminal/Command Prompt, navigate into the folder:
+   - **Mac**: `cd ~/Desktop/smart-stocking`
+   - **Windows**: `cd C:\Users\YourName\Desktop\smart-stocking`
+
+### Step 3 — Install the required packages
+
+Copy and paste this command, then press Enter. It will download everything SmartStock needs (takes 1–3 minutes):
+
+```
+pip install -r requirements.txt
+```
+
+You'll see a lot of text scroll by — that's normal. Wait until you get back to the `>` or `$` prompt.
+
+> **Having trouble?** If you see a "permission denied" error, try: `pip install --user -r requirements.txt`
+
+### Step 4 — Launch the app
+
+```
+streamlit run app.py
+```
+
+Your default web browser will open automatically at `http://localhost:8501`. If it doesn't, copy that address and paste it into your browser.
+
+> **To stop the app** later: click back into the Terminal window and press `Ctrl + C`.
+
+---
+
+### Your first screen (2-minute walkthrough)
+
+Once the app opens in your browser:
+
+**1. Tell it your goal** *(top of the Screening page)*
+
+Pick one of the plain-English goals, for example:
+- *"I want steady income (dividends)"* — focuses on high-yield, stable companies
+- *"I want long-term growth"* — focuses on revenue and earnings growth
+- *"I want low-risk, stable stocks"* — focuses on low volatility
+
+**2. Choose your stocks** *(Stock Selection section)*
+
+Either type tickers yourself (e.g. `AAPL, MSFT, JNJ`) or click **"Or choose a preset list"** and pick something like *"Dividend Aristocrats"* or *"Blue Chip Stability"* from the dropdown. Start with 5 stocks to keep it fast.
+
+**3. Click "Run Analysis"**
+
+SmartStock fetches live data from Yahoo Finance and scores each stock. This takes 15–60 seconds depending on how many stocks you chose.
+
+**4. Read your results** *(switch to the "Analysis" tab)*
+
+- The **⭐ Top Pick** card highlights the best-scoring stock for your goal
+- The **results table** shows each stock's score with a tier label (Excellent / Good / Average / Weak)
+- Click any stock name in the dropdown to see a detailed breakdown, including a chart that shows *exactly why* it scored the way it did
+
+**5. Export** if you want to save your results — use the CSV, Excel, or PDF buttons below the table.
+
+---
+
+### If the data won't load (rate limit fix)
+
+Yahoo Finance limits how often you can fetch data for free. If you see an error or empty results:
+
+1. Wait 2–3 minutes and try again
+2. Reduce the number of stocks (start with just 3–5)
+3. Click **"Try Demo Mode"** to explore the app with simulated data while you wait
+
+---
+
+### Optional: Keep data fresher with free API keys
+
+The app works fine without these, but adding them unlocks faster data and better reliability:
+
+1. Get a free key from [Alpha Vantage](https://www.alphavantage.co/support/#api-key) (5 sec sign-up)
+2. Create a file at `.streamlit/secrets.toml` in the app folder
+3. Add this line (replace with your actual key):
+   ```toml
+   ALPHA_VANTAGE_API_KEY = "YOUR_KEY_HERE"
+   ```
+4. Restart the app
+
+---
+
+
 
 - **Multi-Strategy Analysis**: Apply up to 6 different investment strategies simultaneously
 - **Interactive Visualizations**: Dynamic charts and graphs using Plotly (radar charts, bar charts, score distributions)

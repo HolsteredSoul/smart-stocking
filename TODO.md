@@ -90,3 +90,29 @@ These tasks make the scores more accurate and meaningful.
 - [x] **Add integration test documentation to README** — The `TestDataService` class is silently skipped unless `RUN_INTEGRATION_TESTS=true` is set. Document this in `README.md` so contributors know how to run the full test suite.
 
 - [x] **Centralise magic numbers into a constants module** — Scoring thresholds (P/E < 15, ROE > 20%, etc.), cache expiry times (5 min, 7 days), and default weights are hardcoded in multiple files. Move them to `models/constants.py` so they can be adjusted in one place.
+
+---
+
+## Identified in v1.1 Review — Next Improvements
+
+*Added from post-implementation review (March 2026). Priority order within each section.*
+
+### Technical — Scoring & Data
+
+- [ ] **Add sector-relative value thresholds** *(carries over from High section above)* — A P/E of 25 is cheap for software but expensive for retail. After fetching fundamentals, compute sector medians for P/E, P/B, P/S, EV/EBITDA across the screened set, then score each stock relative to its sector peers rather than against absolute cut-offs. (`services/data_service.py:calculate_value_scores()`)
+
+- [ ] **Replace revenue-growth dividend proxy with actual dividend history** *(carries over from High section above)* — Fetch the `yfinance` `Ticker.dividends` Series for each ticker. Use it to check: (1) paid every quarter for the last 2 years, (2) year-over-year dividend growth direction. Bump sustainable/growing payers, penalise sporadic ones. (`services/data_service.py:calculate_income_scores()` + data-fetch pipeline)
+
+- [ ] **Upgrade to full 9-signal Piotroski F-Score** — Current implementation covers 3 signals (ROE, D/E, current ratio). The remaining 6 signals — cash flow from operations positive, ROA improving YoY, accruals (CFO > net income), leverage trend, gross margin trend, asset turnover trend — require two years of income statement + cash flow data. Fetch them via `yfinance Ticker.financials` / `Ticker.cashflow` and integrate. (`services/data_service.py:calculate_quality_scores()`)
+
+- [ ] **Add transaction costs and slippage to the backtest engine** — `run_backtest()` currently assumes zero cost. Add a configurable round-trip cost parameter (default 0.1% per trade) applied at portfolio formation. Also add a liquidity filter: exclude stocks with average daily dollar volume below a threshold (e.g. <$1M) to avoid unrealistic fills. (`services/data_service.py:run_backtest()`)
+
+### UX — Discovery & Accessibility
+
+- [ ] **Add a stock universe browser so users don't need to know ticker symbols** — Currently users must type tickers manually or pick a preset list. Add a searchable dropdown backed by a static list of S&P 500 (or Russell 2000) constituents — user types a company name and gets the ticker. A CSV of index constituents is small (~10 KB) and can ship with the repo. (`app.py`, ticker input section; new `data/sp500_tickers.csv`)
+
+- [ ] **Add `docker-compose.yml`** — `Dockerfile` is present. A `docker-compose.yml` lets users start the whole app with a single `docker compose up` without needing to remember the `docker run` flags. Two-service version: `app` (Streamlit) + optional `nginx` reverse proxy for local HTTPS. (`docker-compose.yml` in root)
+
+### Code Quality
+
+- [ ] **Deduplicate `STRATEGY_SCORE_COLUMNS` between `app.py` and `data_service.py`** — The canonical mapping (`Momentum → momentum_score`, etc.) is defined in both files and must stay in sync manually. Move it to `models/constants.py` and import from there in both files. Low risk, one-line change in two files. (`models/constants.py`, `app.py`, `services/data_service.py`)
