@@ -1167,15 +1167,24 @@ class DataService:
         
         # Combine scores
         results = fundamentals.copy()
-        
+
         for strategy, scores in strategy_scores.items():
             results[strategy] = scores.reindex(results.index, fill_value=0)
-        
+
+        # Percentile-normalise individual strategy scores within the screened universe
+        # so that a score of 80 always means "better than 80% of the stocks analysed".
+        # This makes absolute thresholds less important and scores more comparable
+        # across different stock universes.
+        if len(results) > 1:
+            score_cols = [c for c in results.columns if c.endswith('_score')]
+            for col in score_cols:
+                results[col] = results[col].rank(pct=True) * 100
+
         # Calculate composite score
         if results.empty:
             st.warning("No stocks available for scoring.")
             return pd.DataFrame()
-        
+
         results['composite_score'] = self._calculate_composite_score(results, config)
         
         # Add additional metrics
@@ -1231,7 +1240,48 @@ class DataService:
                     momentum_score *= 1.1  # Bonus for bullish trend
                 elif current_price < sma_50 < sma_200:
                     momentum_score *= 0.9  # Penalty for bearish trend
-                
+
+                # RSI-14: penalise overbought (>75), reward healthy range (40-70)
+                try:
+                    delta = df['Close'].diff()
+                    gain = delta.clip(lower=0).rolling(14).mean()
+                    loss = (-delta.clip(upper=0)).rolling(14).mean()
+                    rs = gain / loss.replace(0, float('nan'))
+                    rsi = float((100 - 100 / (1 + rs)).iloc[-1]) if len(df) >= 14 else 50.0
+                    if 40 <= rsi <= 70:
+                        momentum_score *= 1.05   # healthy momentum zone
+                    elif rsi > 75:
+                        momentum_score *= 0.95   # overbought — risk of pullback
+                except Exception:
+                    pass
+
+                # Volume confirmation: price up on above-average volume is stronger signal
+                try:
+                    if 'Volume' in df.columns and len(df) >= 20:
+                        avg_vol = df['Volume'].rolling(20).mean().iloc[-1]
+                        recent_vol = float(df['Volume'].iloc[-5:].mean())
+                        price_up = df['Close'].iloc[-1] > df['Close'].iloc[-5]
+                        if price_up and avg_vol > 0 and recent_vol > avg_vol * 1.2:
+                            momentum_score *= 1.05  # strong volume confirmation
+                except Exception:
+                    pass
+
+                # 52-week high/low positioning
+                try:
+                    n_days = min(252, len(df))
+                    high_52 = float(df['Close'].iloc[-n_days:].max())
+                    low_52  = float(df['Close'].iloc[-n_days:].min())
+                    if high_52 > 0:
+                        pct_from_high = (current_price - high_52) / high_52
+                        if pct_from_high >= -0.05:
+                            momentum_score *= 1.05   # within 5% of 52-week high
+                    if low_52 > 0:
+                        pct_from_low = (current_price - low_52) / low_52
+                        if pct_from_low <= 0.20:
+                            momentum_score *= 0.92   # within 20% of 52-week low
+                except Exception:
+                    pass
+
                 # Normalize to 0-100 scale
                 scores[ticker] = max(0, min(100, 50 + momentum_score))
                 
@@ -1249,37 +1299,47 @@ class DataService:
             try:
                 score = 0
                 
-                # P/E ratio scoring (lower is better)
+                # P/E ratio scoring — lower is better (max 25 pts)
                 if pd.notna(row['pe_ratio']) and row['pe_ratio'] > 0:
                     if row['pe_ratio'] < 15:
-                        score += 30
+                        score += 25
                     elif row['pe_ratio'] < 20:
-                        score += 20
+                        score += 17
                     elif row['pe_ratio'] < 30:
-                        score += 10
-                
-                # P/B ratio scoring
+                        score += 8
+
+                # P/B ratio scoring (max 20 pts)
                 if pd.notna(row['pb_ratio']) and row['pb_ratio'] > 0:
                     if row['pb_ratio'] < 1.5:
-                        score += 25
+                        score += 20
                     elif row['pb_ratio'] < 2.5:
-                        score += 15
+                        score += 12
                     elif row['pb_ratio'] < 3.5:
-                        score += 5
-                
-                # EV/EBITDA scoring
+                        score += 4
+
+                # EV/EBITDA scoring (max 20 pts)
                 if pd.notna(row['ev_ebitda']) and row['ev_ebitda'] > 0:
                     if row['ev_ebitda'] < 10:
-                        score += 25
+                        score += 20
                     elif row['ev_ebitda'] < 15:
-                        score += 15
+                        score += 12
                     elif row['ev_ebitda'] < 20:
+                        score += 4
+
+                # P/S ratio scoring — lower is better; useful for low-earnings firms (max 20 pts)
+                ps = row.get('ps_ratio') if 'ps_ratio' in row.index else None
+                if ps is not None and pd.notna(ps) and ps > 0:
+                    if ps < 2:
+                        score += 20
+                    elif ps < 4:
+                        score += 12
+                    elif ps < 8:
                         score += 5
-                
-                # Dividend yield bonus
-                if row['dividend_yield'] > 0.02:  # 2% yield
-                    score += 20
-                
+
+                # Dividend yield bonus (max 15 pts)
+                if pd.notna(row['dividend_yield']) and row['dividend_yield'] > 0.02:
+                    score += 15
+
                 scores[ticker] = min(100, score)
                 
             except Exception as e:
@@ -1326,14 +1386,28 @@ class DataService:
                         score += 20
                     elif profit_margin > 10:
                         score += 10
-                
+
+                # Earnings quality: operating cash flow should back up reported EPS growth
+                try:
+                    ocf = row.get('operating_cashflow') if 'operating_cashflow' in row.index else None
+                    revenue = row.get('revenue', 0) or 0
+                    eps_g = row.get('eps_growth') if 'eps_growth' in row.index else None
+                    if ocf is not None and pd.notna(ocf) and revenue > 0 and eps_g is not None and pd.notna(eps_g):
+                        ocf_margin = ocf / revenue
+                        if ocf_margin > 0.15 and eps_g > 0:
+                            score = min(100, score + 10)   # cash flow confirms earnings growth
+                        elif ocf_margin < 0.05 and eps_g > 0.15:
+                            score = max(0, score - 10)     # earnings not backed by cash
+                except Exception:
+                    pass
+
                 scores[ticker] = min(100, score)
-                
+
             except Exception as e:
                 scores[ticker] = 0
-        
+
         return pd.Series(scores)
-    
+
     def calculate_quality_scores(self, fundamentals: pd.DataFrame) -> pd.Series:
         """Calculate quality scores for stocks"""
         scores = {}
@@ -1379,14 +1453,25 @@ class DataService:
                         score += 10
                     elif profit_margin > 5:
                         score += 5
-                
+
+                # Simplified Piotroski F-Score signals (3 of 9 derivable from available data)
+                # Each point = company shows a positive quality signal
+                piotroski = 0
+                if pd.notna(row.get('roe')) and row['roe'] > 0:
+                    piotroski += 1  # positive profitability (ROA proxy)
+                if pd.notna(row.get('debt_to_equity')) and row['debt_to_equity'] < 1.0:
+                    piotroski += 1  # low leverage
+                if pd.notna(row.get('current_ratio')) and row['current_ratio'] > 1.0:
+                    piotroski += 1  # adequate liquidity
+                score += piotroski * 3  # max 9 bonus points
+
                 scores[ticker] = min(100, score)
-                
+
             except Exception as e:
                 scores[ticker] = 0
-        
+
         return pd.Series(scores)
-    
+
     def calculate_income_scores(self, fundamentals: pd.DataFrame) -> pd.Series:
         """Calculate income/dividend scores for stocks"""
         scores = {}
