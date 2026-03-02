@@ -68,16 +68,7 @@ except ImportError:  # pragma: no cover
 
     st = _StubSt()  # type: ignore[assignment]
 
-# Canonical mapping: strategy display name -> score column name
-# Must stay in sync with the copy in app.py
-STRATEGY_SCORE_COLUMNS = {
-    'Momentum': 'momentum_score',
-    'Value': 'value_score',
-    'Growth': 'growth_score',
-    'Quality': 'quality_score',
-    'Income': 'income_score',
-    'Low Volatility': 'volatility_score',
-}
+from models.constants import STRATEGY_SCORE_COLUMNS  # single source of truth
 
 class DataService:
     """Handles all data fetching and processing operations"""

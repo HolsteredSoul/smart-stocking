@@ -27,16 +27,7 @@ from utils.enhanced_ui import EnhancedUIComponents
 from utils.data_cache_manager import DataCacheManager
 from pages.troubleshooting import troubleshooting_page
 
-# Canonical mapping: strategy display name -> score column name in DataFrames
-# This MUST match the column names produced by DataService._run_screening_async()
-STRATEGY_SCORE_COLUMNS = {
-    'Momentum': 'momentum_score',
-    'Value': 'value_score',
-    'Growth': 'growth_score',
-    'Quality': 'quality_score',
-    'Income': 'income_score',
-    'Low Volatility': 'volatility_score',
-}
+from models.constants import STRATEGY_SCORE_COLUMNS  # noqa: E402 — single source of truth
 
 # ---------------------------------------------------------------------------
 # UI helpers
