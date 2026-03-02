@@ -754,6 +754,12 @@ class DataService:
                         'industry': 'Unknown',
                         'dividend_consistent': False,
                         'dividend_growing': False,
+                        'pio_cfo_positive': False,
+                        'pio_roa_improving': False,
+                        'pio_low_accruals': False,
+                        'pio_leverage_falling': False,
+                        'pio_gross_margin_improving': False,
+                        'pio_asset_turnover_improving': False,
                     }
                     
                 except Exception as e:
@@ -822,6 +828,79 @@ class DataService:
                             if not info or len(info) <= 1:
                                 raise Exception("Empty info received")
                                 
+                            # --- Piotroski signals 4-9 (require 2-year financials) ---
+                            # Signal 4: CFO > 0
+                            # Signal 5: ROA improving YoY
+                            # Signal 6: Accruals (CFO/assets > net_income/assets)
+                            # Signal 7: Long-term leverage decreasing YoY
+                            # Signal 8: Gross margin improving YoY
+                            # Signal 9: Asset turnover improving YoY
+                            pio_cfo_positive = False
+                            pio_roa_improving = False
+                            pio_low_accruals = False
+                            pio_leverage_falling = False
+                            pio_gross_margin_improving = False
+                            pio_asset_turnover_improving = False
+                            try:
+                                fin = stock.financials   # columns = most-recent .. oldest
+                                cf  = stock.cashflow
+                                bs  = stock.balance_sheet
+                                if (fin is not None and not fin.empty and
+                                        cf is not None and not cf.empty and
+                                        bs is not None and not bs.empty and
+                                        fin.shape[1] >= 2 and cf.shape[1] >= 2):
+                                    # Helper: safe get from df by row label
+                                    def _row(df, *labels):
+                                        for lbl in labels:
+                                            if lbl in df.index:
+                                                vals = df.loc[lbl]
+                                                return float(vals.iloc[0]), float(vals.iloc[1])
+                                        return None, None
+
+                                    cfo_curr, cfo_prev = _row(cf,
+                                        'Operating Cash Flow', 'Total Cash From Operating Activities')
+                                    net_curr, net_prev = _row(fin,
+                                        'Net Income', 'Net Income Common Stockholders')
+                                    rev_curr, rev_prev = _row(fin,
+                                        'Total Revenue')
+                                    gross_curr, gross_prev = _row(fin,
+                                        'Gross Profit')
+                                    ta_curr, ta_prev = _row(bs,
+                                        'Total Assets')
+                                    ltd_curr, ltd_prev = _row(bs,
+                                        'Long Term Debt')
+
+                                    if cfo_curr is not None:
+                                        pio_cfo_positive = cfo_curr > 0
+
+                                    if (ta_curr and ta_prev and ta_curr > 0 and ta_prev > 0
+                                            and net_curr is not None and net_prev is not None):
+                                        roa_curr = net_curr / ta_curr
+                                        roa_prev = net_prev / ta_prev
+                                        pio_roa_improving = roa_curr > roa_prev
+
+                                        if cfo_curr is not None:
+                                            pio_low_accruals = (cfo_curr / ta_curr) > (net_curr / ta_curr)
+
+                                        if ltd_curr is not None and ltd_prev is not None:
+                                            lev_curr = ltd_curr / ta_curr
+                                            lev_prev = ltd_prev / ta_prev
+                                            pio_leverage_falling = lev_curr < lev_prev
+
+                                    if (rev_curr and rev_prev and gross_curr is not None
+                                            and gross_prev is not None and rev_curr > 0 and rev_prev > 0):
+                                        gm_curr = gross_curr / rev_curr
+                                        gm_prev = gross_prev / rev_prev
+                                        pio_gross_margin_improving = gm_curr > gm_prev
+
+                                        if ta_curr and ta_curr > 0 and ta_prev and ta_prev > 0:
+                                            at_curr = rev_curr / ta_curr
+                                            at_prev = rev_prev / ta_prev
+                                            pio_asset_turnover_improving = at_curr > at_prev
+
+                            except Exception:
+                                pass
+
                             # Dividend history signals (actual payment track record)
                             dividend_consistent = False
                             dividend_growing = False
@@ -865,6 +944,13 @@ class DataService:
                                 'current_price': info.get('currentPrice', current_price),
                                 'dividend_consistent': dividend_consistent,
                                 'dividend_growing': dividend_growing,
+                                # Piotroski signals 4-9
+                                'pio_cfo_positive': pio_cfo_positive,
+                                'pio_roa_improving': pio_roa_improving,
+                                'pio_low_accruals': pio_low_accruals,
+                                'pio_leverage_falling': pio_leverage_falling,
+                                'pio_gross_margin_improving': pio_gross_margin_improving,
+                                'pio_asset_turnover_improving': pio_asset_turnover_improving,
                             }
                         except Exception as e:
                             if attempt == 2:  # Last attempt
@@ -1662,16 +1748,38 @@ class DataService:
                     elif profit_margin > 5:
                         score += 5
 
-                # Simplified Piotroski F-Score signals (3 of 9 derivable from available data)
-                # Each point = company shows a positive quality signal
+                # Full Piotroski F-Score (9 signals, 3 pts each = max 27 bonus pts)
+                # Signals 1-3: derivable from standard fundamentals
+                # Signals 4-9: require 2-year income statement + cash flow data
                 piotroski = 0
+                # Signal 1: positive ROE (profitability proxy for ROA)
                 if pd.notna(row.get('roe')) and row['roe'] > 0:
-                    piotroski += 1  # positive profitability (ROA proxy)
+                    piotroski += 1
+                # Signal 2: low leverage (D/E < 1)
                 if pd.notna(row.get('debt_to_equity')) and row['debt_to_equity'] < 1.0:
-                    piotroski += 1  # low leverage
+                    piotroski += 1
+                # Signal 3: adequate liquidity (current ratio > 1)
                 if pd.notna(row.get('current_ratio')) and row['current_ratio'] > 1.0:
-                    piotroski += 1  # adequate liquidity
-                score += piotroski * 3  # max 9 bonus points
+                    piotroski += 1
+                # Signal 4: operating cash flow > 0
+                if row.get('pio_cfo_positive', False):
+                    piotroski += 1
+                # Signal 5: ROA improving year-over-year
+                if row.get('pio_roa_improving', False):
+                    piotroski += 1
+                # Signal 6: low accruals (CFO/assets > net income/assets)
+                if row.get('pio_low_accruals', False):
+                    piotroski += 1
+                # Signal 7: long-term leverage ratio falling
+                if row.get('pio_leverage_falling', False):
+                    piotroski += 1
+                # Signal 8: gross margin improving year-over-year
+                if row.get('pio_gross_margin_improving', False):
+                    piotroski += 1
+                # Signal 9: asset turnover improving year-over-year
+                if row.get('pio_asset_turnover_improving', False):
+                    piotroski += 1
+                score += piotroski * 3  # max 27 bonus pts; capped at 100 below
 
                 scores[ticker] = min(100, score)
 
