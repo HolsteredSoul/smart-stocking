@@ -1,0 +1,22 @@
+{
+  "default_lookback": "1 Year",
+  "default_scoring": "Rank Aggregation",
+  "default_min_market_cap": 2.0,
+  "max_stocks": 10,
+  "alpha_vantage_key": "",
+  "finnhub_key": "",
+  "fmp_key": "",
+  "polygon_key": "",
+  "strategy_weights": {
+    "Momentum": 0.16666666666666666,
+    "Value": 0.16666666666666666,
+    "Growth": 0.16666666666666666,
+    "Quality": 0.16666666666666666,
+    "Income": 0.16666666666666666,
+    "Low Volatility": 0.16666666666666666
+  },
+  "chart_theme": "seaborn",
+  "default_chart_height": 500,
+  "show_welcome": true,
+  "show_tooltips": true
+}
