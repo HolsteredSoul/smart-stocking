@@ -165,14 +165,33 @@ class ChartBuilder:
             height=600
         )
         
-        # Add quadrant lines if data exists
+        # Add quadrant lines and labels if enough data exists
         if not results_df.empty and len(results_df) > 1:
             median_vol = results_df['volatility'].median()
             median_score = results_df['composite_score'].median()
-            
+
             fig.add_hline(y=median_score, line_dash="dash", line_color="gray")
             fig.add_vline(x=median_vol, line_dash="dash", line_color="gray")
-        
+
+            # Quadrant label positions
+            vol_min = results_df['volatility'].min()
+            vol_max = results_df['volatility'].max()
+            score_min = results_df['composite_score'].min()
+            score_max = results_df['composite_score'].max()
+
+            quadrant_annotations = [
+                (vol_min,       score_max * 0.97, "Sweet Spot",            "green"),
+                (median_vol * 1.02, score_max * 0.97, "High Risk / High Reward", "orange"),
+                (vol_min,       score_min * 1.04, "Safe but Slow",          "#1f77b4"),
+                (median_vol * 1.02, score_min * 1.04, "Avoid",             "#dc3545"),
+            ]
+            for ax, ay, text, color in quadrant_annotations:
+                fig.add_annotation(
+                    x=ax, y=ay, text=text, showarrow=False,
+                    font=dict(color=color, size=11), opacity=0.65,
+                    xanchor="left",
+                )
+
         return fig
     
     def create_score_distribution(self, results_df: pd.DataFrame) -> go.Figure:
