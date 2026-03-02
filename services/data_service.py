@@ -1194,24 +1194,28 @@ class DataService:
         start_date: str,
         end_date: str,
         top_n: int = 10,
+        cost_pct: float = 0.001,
+        min_avg_daily_volume: int = 1_000_000,
     ) -> Dict[str, Any]:
         """
         Run a basic historical backtest.
 
         Steps:
         1. Fetch price data up to *start_date* and score the universe.
-        2. Select the top-N stocks by composite score → equal-weight portfolio.
-        3. Fetch price data from *start_date* to *end_date* for those tickers.
-        4. Compute portfolio returns, max drawdown, and annualised Sharpe ratio.
+        2. Apply liquidity filter: exclude tickers whose average daily dollar
+           volume over the forward period falls below *min_avg_daily_volume*.
+        3. Select top-N stocks → equal-weight portfolio.
+        4. Deduct *cost_pct* round-trip transaction cost at formation.
+        5. Compute portfolio returns, max drawdown, and annualised Sharpe.
 
-        Returns a dict with metrics and a ``portfolio_values`` DataFrame.
+        Args:
+            cost_pct: Round-trip transaction cost as a fraction (default 0.001 = 0.1%).
+            min_avg_daily_volume: Minimum average daily dollar volume to include a stock.
         """
         if yf is None:
             return {"error": "yfinance is not installed; cannot run backtest."}
 
         try:
-            from datetime import datetime as _dt
-
             # --- Step 1: Score universe at start_date ---
             hist_config_tickers = config.tickers
             price_hist = {}
@@ -1227,38 +1231,58 @@ class DataService:
             if not price_hist:
                 return {"error": "Could not fetch historical data for backtest start date."}
 
-            momentum_s  = self.calculate_momentum_scores(price_hist)
-            # Build a minimal fundamentals frame with the tickers we have data for
+            momentum_s = self.calculate_momentum_scores(price_hist)
             valid_tickers = list(price_hist.keys())
             ranked = momentum_s.reindex(valid_tickers).fillna(0)
-            top_tickers = ranked.nlargest(top_n).index.tolist()
+            # Select more candidates than needed so the liquidity filter has room
+            candidate_tickers = ranked.nlargest(top_n * 2).index.tolist()
 
-            if not top_tickers:
+            if not candidate_tickers:
                 return {"error": "No tickers available after ranking."}
 
-            # --- Step 2 & 3: Fetch forward price data ---
-            fwd_prices = {}
-            for ticker in top_tickers:
+            # --- Step 2 & 3: Fetch forward price + volume data ---
+            fwd_data: Dict[str, pd.DataFrame] = {}
+            for ticker in candidate_tickers:
                 try:
                     df = yf.download(ticker, start=start_date, end=end_date,
                                      auto_adjust=True, progress=False)
                     if not df.empty:
-                        fwd_prices[ticker] = df['Close']
+                        fwd_data[ticker] = df
                 except Exception:
                     pass
 
-            if not fwd_prices:
+            if not fwd_data:
                 return {"error": "Could not fetch forward price data for backtest period."}
 
-            # --- Step 4: Equal-weight portfolio ---
+            # --- Liquidity filter ---
+            liquid_tickers = []
+            for ticker, df in fwd_data.items():
+                if 'Volume' in df.columns and 'Close' in df.columns:
+                    avg_dollar_vol = float((df['Close'] * df['Volume']).mean())
+                    if avg_dollar_vol >= min_avg_daily_volume:
+                        liquid_tickers.append(ticker)
+                else:
+                    liquid_tickers.append(ticker)  # no volume data → include anyway
+
+            # Re-rank among liquid candidates and take top_n
+            liquid_ranked = ranked.reindex(liquid_tickers).dropna()
+            top_tickers = liquid_ranked.nlargest(top_n).index.tolist()
+
+            if not top_tickers:
+                return {"error": "No liquid tickers remaining after liquidity filter."}
+
+            fwd_prices = {t: fwd_data[t]['Close'] for t in top_tickers if t in fwd_data}
+
+            # --- Step 4: Equal-weight portfolio with transaction costs ---
             price_df = pd.DataFrame(fwd_prices).dropna(how='all').ffill()
-            # Normalise each stock to 1.0 at start
             norm = price_df / price_df.iloc[0]
-            portfolio = norm.mean(axis=1)   # equal-weight
+            portfolio = norm.mean(axis=1)  # equal-weight
+            # Deduct one-way cost at entry (sell cost paid at exit is reflected in returns)
+            portfolio = portfolio * (1.0 - cost_pct)
 
             total_return = float((portfolio.iloc[-1] - 1.0) * 100)
             n_years = max((price_df.index[-1] - price_df.index[0]).days / 365.25, 1 / 365)
-            ann_return = float(((portfolio.iloc[-1]) ** (1 / n_years) - 1) * 100)
+            ann_return = float((portfolio.iloc[-1] ** (1 / n_years) - 1) * 100)
 
             # Max drawdown
             rolling_max = portfolio.cummax()
@@ -1275,14 +1299,17 @@ class DataService:
                 "Portfolio Value": (portfolio * 100).values,
             }).set_index("Date")
 
+            excluded = len(candidate_tickers) - len(liquid_tickers)
             return {
-                "top_tickers":       top_tickers,
-                "total_return_pct":  round(total_return, 2),
-                "ann_return_pct":    round(ann_return, 2),
-                "max_drawdown_pct":  round(max_drawdown, 2),
-                "sharpe_ratio":      round(sharpe, 2),
-                "portfolio_values":  portfolio_values,
-                "n_stocks":          len(fwd_prices),
+                "top_tickers":           top_tickers,
+                "total_return_pct":      round(total_return, 2),
+                "ann_return_pct":        round(ann_return, 2),
+                "max_drawdown_pct":      round(max_drawdown, 2),
+                "sharpe_ratio":          round(sharpe, 2),
+                "portfolio_values":      portfolio_values,
+                "n_stocks":              len(fwd_prices),
+                "cost_pct":              cost_pct,
+                "excluded_illiquid":     excluded,
             }
 
         except Exception as exc:

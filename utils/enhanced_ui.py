@@ -580,7 +580,26 @@ class EnhancedUIComponents:
                     step=1000,
                     help="Starting capital for the backtest"
                 )
-            
+
+                cost_pct = st.slider(
+                    "Transaction Cost (% round-trip)",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=0.1,
+                    step=0.05,
+                    format="%.2f%%",
+                    help="Estimated round-trip trading cost including commissions and spread (0.1% is a reasonable default for liquid US stocks)",
+                ) / 100.0  # convert from % to fraction
+
+                min_daily_volume = st.number_input(
+                    "Min. Average Daily Dollar Volume ($)",
+                    min_value=0,
+                    max_value=100_000_000,
+                    value=1_000_000,
+                    step=500_000,
+                    help="Exclude stocks that are too thinly traded. $1M/day is a sensible minimum for retail investors.",
+                )
+
             # Strategy selection using the enhanced strategy selector
             strategies = {
                 "Momentum": "12-month price momentum and trend analysis",
@@ -635,6 +654,8 @@ class EnhancedUIComponents:
                             start_date=str(start_date),
                             end_date=str(end_date),
                             top_n=top_n,
+                            cost_pct=cost_pct,
+                            min_avg_daily_volume=min_daily_volume,
                         )
 
                     if "error" in result:
@@ -661,8 +682,12 @@ class EnhancedUIComponents:
     def _show_real_backtest_results(result: dict, initial_capital: float, benchmark: str = None):
         """Display real backtest results returned by DataService.run_backtest()."""
         st.subheader("Backtest Results")
+        cost_label = f"{result.get('cost_pct', 0) * 100:.2f}% round-trip cost applied"
+        excluded = result.get("excluded_illiquid", 0)
+        excluded_label = f" · {excluded} illiquid stock(s) excluded" if excluded else ""
         st.caption(
-            f"Equal-weight portfolio of top {result.get('n_stocks', '?')} stocks: "
+            f"Equal-weight portfolio of top {result.get('n_stocks', '?')} stocks "
+            f"({cost_label}{excluded_label}): "
             + ", ".join(result.get("top_tickers", []))
         )
 
