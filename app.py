@@ -922,6 +922,22 @@ def stock_detail_view(ticker: str, results_df: pd.DataFrame):
     
     # ---- Export tab ----
     with tabs[3]:
+        # PDF report
+        if st.button("📑 Download PDF Report", key="stock_pdf_btn", use_container_width=True):
+            from utils.enhanced_ui import EnhancedUIComponents
+            pdf_bytes = EnhancedUIComponents._generate_comparison_pdf(results_df, [ticker])
+            if pdf_bytes:
+                st.download_button(
+                    "📥 Save PDF",
+                    data=pdf_bytes,
+                    file_name=f"{ticker}_smartstock.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key="stock_pdf_dl",
+                )
+            else:
+                st.warning("Install fpdf2 (`pip install fpdf2`) to enable PDF exports.")
+
         if st.button("📊 Generate Excel Report", key="stock_excel_btn", use_container_width=True):
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:

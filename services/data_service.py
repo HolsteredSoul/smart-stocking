@@ -1194,9 +1194,110 @@ class DataService:
         results = results.sort_values('composite_score', ascending=False)
         
         st.success(f"✅ Analysis complete! Successfully analyzed {len(results)} stocks.")
-        
+
         return results
-    
+
+    def run_backtest(
+        self,
+        config,
+        start_date: str,
+        end_date: str,
+        top_n: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        Run a basic historical backtest.
+
+        Steps:
+        1. Fetch price data up to *start_date* and score the universe.
+        2. Select the top-N stocks by composite score → equal-weight portfolio.
+        3. Fetch price data from *start_date* to *end_date* for those tickers.
+        4. Compute portfolio returns, max drawdown, and annualised Sharpe ratio.
+
+        Returns a dict with metrics and a ``portfolio_values`` DataFrame.
+        """
+        if yf is None:
+            return {"error": "yfinance is not installed; cannot run backtest."}
+
+        try:
+            from datetime import datetime as _dt
+
+            # --- Step 1: Score universe at start_date ---
+            hist_config_tickers = config.tickers
+            price_hist = {}
+            for ticker in hist_config_tickers:
+                try:
+                    df = yf.download(ticker, end=start_date, period="1y",
+                                     auto_adjust=True, progress=False)
+                    if not df.empty:
+                        price_hist[ticker] = df
+                except Exception:
+                    pass
+
+            if not price_hist:
+                return {"error": "Could not fetch historical data for backtest start date."}
+
+            momentum_s  = self.calculate_momentum_scores(price_hist)
+            # Build a minimal fundamentals frame with the tickers we have data for
+            valid_tickers = list(price_hist.keys())
+            ranked = momentum_s.reindex(valid_tickers).fillna(0)
+            top_tickers = ranked.nlargest(top_n).index.tolist()
+
+            if not top_tickers:
+                return {"error": "No tickers available after ranking."}
+
+            # --- Step 2 & 3: Fetch forward price data ---
+            fwd_prices = {}
+            for ticker in top_tickers:
+                try:
+                    df = yf.download(ticker, start=start_date, end=end_date,
+                                     auto_adjust=True, progress=False)
+                    if not df.empty:
+                        fwd_prices[ticker] = df['Close']
+                except Exception:
+                    pass
+
+            if not fwd_prices:
+                return {"error": "Could not fetch forward price data for backtest period."}
+
+            # --- Step 4: Equal-weight portfolio ---
+            price_df = pd.DataFrame(fwd_prices).dropna(how='all').ffill()
+            # Normalise each stock to 1.0 at start
+            norm = price_df / price_df.iloc[0]
+            portfolio = norm.mean(axis=1)   # equal-weight
+
+            total_return = float((portfolio.iloc[-1] - 1.0) * 100)
+            n_years = max((price_df.index[-1] - price_df.index[0]).days / 365.25, 1 / 365)
+            ann_return = float(((portfolio.iloc[-1]) ** (1 / n_years) - 1) * 100)
+
+            # Max drawdown
+            rolling_max = portfolio.cummax()
+            drawdown = (portfolio - rolling_max) / rolling_max
+            max_drawdown = float(drawdown.min() * 100)
+
+            # Annualised Sharpe (vs 4% risk-free)
+            daily_ret = portfolio.pct_change().dropna()
+            excess = daily_ret - 0.04 / 252
+            sharpe = float(excess.mean() / excess.std() * (252 ** 0.5)) if excess.std() > 0 else 0.0
+
+            portfolio_values = pd.DataFrame({
+                "Date":            portfolio.index,
+                "Portfolio Value": (portfolio * 100).values,
+            }).set_index("Date")
+
+            return {
+                "top_tickers":       top_tickers,
+                "total_return_pct":  round(total_return, 2),
+                "ann_return_pct":    round(ann_return, 2),
+                "max_drawdown_pct":  round(max_drawdown, 2),
+                "sharpe_ratio":      round(sharpe, 2),
+                "portfolio_values":  portfolio_values,
+                "n_stocks":          len(fwd_prices),
+            }
+
+        except Exception as exc:
+            self.logger.warning(f"Backtest error: {exc}")
+            return {"error": str(exc)}
+
     def calculate_momentum_scores(self, price_data: Dict[str, pd.DataFrame]) -> pd.Series:
         """Calculate momentum scores for stocks using vectorized operations"""
         scores = {}
