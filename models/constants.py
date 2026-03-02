@@ -155,3 +155,16 @@ SCORE_TIERS = [
     (40, "Average",   "#ffc107"),
     ( 0, "Weak",      "#dc3545"),
 ]
+
+# ---------------------------------------------------------------------------
+# Strategy → score column mapping  (single source of truth)
+# ---------------------------------------------------------------------------
+
+STRATEGY_SCORE_COLUMNS = {
+    'Momentum':      'momentum_score',
+    'Value':         'value_score',
+    'Growth':        'growth_score',
+    'Quality':       'quality_score',
+    'Income':        'income_score',
+    'Low Volatility':'volatility_score',
+}

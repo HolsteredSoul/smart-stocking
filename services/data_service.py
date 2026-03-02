@@ -68,16 +68,7 @@ except ImportError:  # pragma: no cover
 
     st = _StubSt()  # type: ignore[assignment]
 
-# Canonical mapping: strategy display name -> score column name
-# Must stay in sync with the copy in app.py
-STRATEGY_SCORE_COLUMNS = {
-    'Momentum': 'momentum_score',
-    'Value': 'value_score',
-    'Growth': 'growth_score',
-    'Quality': 'quality_score',
-    'Income': 'income_score',
-    'Low Volatility': 'volatility_score',
-}
+from models.constants import STRATEGY_SCORE_COLUMNS  # single source of truth
 
 class DataService:
     """Handles all data fetching and processing operations"""
@@ -760,7 +751,15 @@ class DataService:
                         'payout_ratio': np.nan,
                         'beta': np.nan,
                         'sector': 'Unknown',
-                        'industry': 'Unknown'
+                        'industry': 'Unknown',
+                        'dividend_consistent': False,
+                        'dividend_growing': False,
+                        'pio_cfo_positive': False,
+                        'pio_roa_improving': False,
+                        'pio_low_accruals': False,
+                        'pio_leverage_falling': False,
+                        'pio_gross_margin_improving': False,
+                        'pio_asset_turnover_improving': False,
                     }
                     
                 except Exception as e:
@@ -829,6 +828,98 @@ class DataService:
                             if not info or len(info) <= 1:
                                 raise Exception("Empty info received")
                                 
+                            # --- Piotroski signals 4-9 (require 2-year financials) ---
+                            # Signal 4: CFO > 0
+                            # Signal 5: ROA improving YoY
+                            # Signal 6: Accruals (CFO/assets > net_income/assets)
+                            # Signal 7: Long-term leverage decreasing YoY
+                            # Signal 8: Gross margin improving YoY
+                            # Signal 9: Asset turnover improving YoY
+                            pio_cfo_positive = False
+                            pio_roa_improving = False
+                            pio_low_accruals = False
+                            pio_leverage_falling = False
+                            pio_gross_margin_improving = False
+                            pio_asset_turnover_improving = False
+                            try:
+                                fin = stock.financials   # columns = most-recent .. oldest
+                                cf  = stock.cashflow
+                                bs  = stock.balance_sheet
+                                if (fin is not None and not fin.empty and
+                                        cf is not None and not cf.empty and
+                                        bs is not None and not bs.empty and
+                                        fin.shape[1] >= 2 and cf.shape[1] >= 2):
+                                    # Helper: safe get from df by row label
+                                    def _row(df, *labels):
+                                        for lbl in labels:
+                                            if lbl in df.index:
+                                                vals = df.loc[lbl]
+                                                return float(vals.iloc[0]), float(vals.iloc[1])
+                                        return None, None
+
+                                    cfo_curr, cfo_prev = _row(cf,
+                                        'Operating Cash Flow', 'Total Cash From Operating Activities')
+                                    net_curr, net_prev = _row(fin,
+                                        'Net Income', 'Net Income Common Stockholders')
+                                    rev_curr, rev_prev = _row(fin,
+                                        'Total Revenue')
+                                    gross_curr, gross_prev = _row(fin,
+                                        'Gross Profit')
+                                    ta_curr, ta_prev = _row(bs,
+                                        'Total Assets')
+                                    ltd_curr, ltd_prev = _row(bs,
+                                        'Long Term Debt')
+
+                                    if cfo_curr is not None:
+                                        pio_cfo_positive = cfo_curr > 0
+
+                                    if (ta_curr and ta_prev and ta_curr > 0 and ta_prev > 0
+                                            and net_curr is not None and net_prev is not None):
+                                        roa_curr = net_curr / ta_curr
+                                        roa_prev = net_prev / ta_prev
+                                        pio_roa_improving = roa_curr > roa_prev
+
+                                        if cfo_curr is not None:
+                                            pio_low_accruals = (cfo_curr / ta_curr) > (net_curr / ta_curr)
+
+                                        if ltd_curr is not None and ltd_prev is not None:
+                                            lev_curr = ltd_curr / ta_curr
+                                            lev_prev = ltd_prev / ta_prev
+                                            pio_leverage_falling = lev_curr < lev_prev
+
+                                    if (rev_curr and rev_prev and gross_curr is not None
+                                            and gross_prev is not None and rev_curr > 0 and rev_prev > 0):
+                                        gm_curr = gross_curr / rev_curr
+                                        gm_prev = gross_prev / rev_prev
+                                        pio_gross_margin_improving = gm_curr > gm_prev
+
+                                        if ta_curr and ta_curr > 0 and ta_prev and ta_prev > 0:
+                                            at_curr = rev_curr / ta_curr
+                                            at_prev = rev_prev / ta_prev
+                                            pio_asset_turnover_improving = at_curr > at_prev
+
+                            except Exception:
+                                pass
+
+                            # Dividend history signals (actual payment track record)
+                            dividend_consistent = False
+                            dividend_growing = False
+                            try:
+                                divs = stock.dividends
+                                if not divs.empty:
+                                    tz = divs.index.tz
+                                    now = pd.Timestamp.now(tz=tz)
+                                    two_yrs_ago = now - pd.DateOffset(years=2)
+                                    one_yr_ago = now - pd.DateOffset(years=1)
+                                    recent = divs[divs.index >= two_yrs_ago]
+                                    dividend_consistent = len(recent) >= 4
+                                    curr_yr = divs[divs.index >= one_yr_ago]
+                                    prev_yr = divs[(divs.index >= two_yrs_ago) & (divs.index < one_yr_ago)]
+                                    if not curr_yr.empty and not prev_yr.empty:
+                                        dividend_growing = float(curr_yr.sum()) >= float(prev_yr.sum())
+                            except Exception:
+                                pass
+
                             # Extract fundamental data
                             return {
                                 'ticker': ticker,
@@ -850,7 +941,16 @@ class DataService:
                                 'beta': info.get('beta', np.nan),
                                 'sector': info.get('sector', 'Unknown'),
                                 'industry': info.get('industry', 'Unknown'),
-                                'current_price': info.get('currentPrice', current_price)
+                                'current_price': info.get('currentPrice', current_price),
+                                'dividend_consistent': dividend_consistent,
+                                'dividend_growing': dividend_growing,
+                                # Piotroski signals 4-9
+                                'pio_cfo_positive': pio_cfo_positive,
+                                'pio_roa_improving': pio_roa_improving,
+                                'pio_low_accruals': pio_low_accruals,
+                                'pio_leverage_falling': pio_leverage_falling,
+                                'pio_gross_margin_improving': pio_gross_margin_improving,
+                                'pio_asset_turnover_improving': pio_asset_turnover_improving,
                             }
                         except Exception as e:
                             if attempt == 2:  # Last attempt
@@ -1203,24 +1303,28 @@ class DataService:
         start_date: str,
         end_date: str,
         top_n: int = 10,
+        cost_pct: float = 0.001,
+        min_avg_daily_volume: int = 1_000_000,
     ) -> Dict[str, Any]:
         """
         Run a basic historical backtest.
 
         Steps:
         1. Fetch price data up to *start_date* and score the universe.
-        2. Select the top-N stocks by composite score → equal-weight portfolio.
-        3. Fetch price data from *start_date* to *end_date* for those tickers.
-        4. Compute portfolio returns, max drawdown, and annualised Sharpe ratio.
+        2. Apply liquidity filter: exclude tickers whose average daily dollar
+           volume over the forward period falls below *min_avg_daily_volume*.
+        3. Select top-N stocks → equal-weight portfolio.
+        4. Deduct *cost_pct* round-trip transaction cost at formation.
+        5. Compute portfolio returns, max drawdown, and annualised Sharpe.
 
-        Returns a dict with metrics and a ``portfolio_values`` DataFrame.
+        Args:
+            cost_pct: Round-trip transaction cost as a fraction (default 0.001 = 0.1%).
+            min_avg_daily_volume: Minimum average daily dollar volume to include a stock.
         """
         if yf is None:
             return {"error": "yfinance is not installed; cannot run backtest."}
 
         try:
-            from datetime import datetime as _dt
-
             # --- Step 1: Score universe at start_date ---
             hist_config_tickers = config.tickers
             price_hist = {}
@@ -1236,38 +1340,58 @@ class DataService:
             if not price_hist:
                 return {"error": "Could not fetch historical data for backtest start date."}
 
-            momentum_s  = self.calculate_momentum_scores(price_hist)
-            # Build a minimal fundamentals frame with the tickers we have data for
+            momentum_s = self.calculate_momentum_scores(price_hist)
             valid_tickers = list(price_hist.keys())
             ranked = momentum_s.reindex(valid_tickers).fillna(0)
-            top_tickers = ranked.nlargest(top_n).index.tolist()
+            # Select more candidates than needed so the liquidity filter has room
+            candidate_tickers = ranked.nlargest(top_n * 2).index.tolist()
 
-            if not top_tickers:
+            if not candidate_tickers:
                 return {"error": "No tickers available after ranking."}
 
-            # --- Step 2 & 3: Fetch forward price data ---
-            fwd_prices = {}
-            for ticker in top_tickers:
+            # --- Step 2 & 3: Fetch forward price + volume data ---
+            fwd_data: Dict[str, pd.DataFrame] = {}
+            for ticker in candidate_tickers:
                 try:
                     df = yf.download(ticker, start=start_date, end=end_date,
                                      auto_adjust=True, progress=False)
                     if not df.empty:
-                        fwd_prices[ticker] = df['Close']
+                        fwd_data[ticker] = df
                 except Exception:
                     pass
 
-            if not fwd_prices:
+            if not fwd_data:
                 return {"error": "Could not fetch forward price data for backtest period."}
 
-            # --- Step 4: Equal-weight portfolio ---
+            # --- Liquidity filter ---
+            liquid_tickers = []
+            for ticker, df in fwd_data.items():
+                if 'Volume' in df.columns and 'Close' in df.columns:
+                    avg_dollar_vol = float((df['Close'] * df['Volume']).mean())
+                    if avg_dollar_vol >= min_avg_daily_volume:
+                        liquid_tickers.append(ticker)
+                else:
+                    liquid_tickers.append(ticker)  # no volume data → include anyway
+
+            # Re-rank among liquid candidates and take top_n
+            liquid_ranked = ranked.reindex(liquid_tickers).dropna()
+            top_tickers = liquid_ranked.nlargest(top_n).index.tolist()
+
+            if not top_tickers:
+                return {"error": "No liquid tickers remaining after liquidity filter."}
+
+            fwd_prices = {t: fwd_data[t]['Close'] for t in top_tickers if t in fwd_data}
+
+            # --- Step 4: Equal-weight portfolio with transaction costs ---
             price_df = pd.DataFrame(fwd_prices).dropna(how='all').ffill()
-            # Normalise each stock to 1.0 at start
             norm = price_df / price_df.iloc[0]
-            portfolio = norm.mean(axis=1)   # equal-weight
+            portfolio = norm.mean(axis=1)  # equal-weight
+            # Deduct one-way cost at entry (sell cost paid at exit is reflected in returns)
+            portfolio = portfolio * (1.0 - cost_pct)
 
             total_return = float((portfolio.iloc[-1] - 1.0) * 100)
             n_years = max((price_df.index[-1] - price_df.index[0]).days / 365.25, 1 / 365)
-            ann_return = float(((portfolio.iloc[-1]) ** (1 / n_years) - 1) * 100)
+            ann_return = float((portfolio.iloc[-1] ** (1 / n_years) - 1) * 100)
 
             # Max drawdown
             rolling_max = portfolio.cummax()
@@ -1284,14 +1408,17 @@ class DataService:
                 "Portfolio Value": (portfolio * 100).values,
             }).set_index("Date")
 
+            excluded = len(candidate_tickers) - len(liquid_tickers)
             return {
-                "top_tickers":       top_tickers,
-                "total_return_pct":  round(total_return, 2),
-                "ann_return_pct":    round(ann_return, 2),
-                "max_drawdown_pct":  round(max_drawdown, 2),
-                "sharpe_ratio":      round(sharpe, 2),
-                "portfolio_values":  portfolio_values,
-                "n_stocks":          len(fwd_prices),
+                "top_tickers":           top_tickers,
+                "total_return_pct":      round(total_return, 2),
+                "ann_return_pct":        round(ann_return, 2),
+                "max_drawdown_pct":      round(max_drawdown, 2),
+                "sharpe_ratio":          round(sharpe, 2),
+                "portfolio_values":      portfolio_values,
+                "n_stocks":              len(fwd_prices),
+                "cost_pct":              cost_pct,
+                "excluded_illiquid":     excluded,
             }
 
         except Exception as exc:
@@ -1393,59 +1520,125 @@ class DataService:
         return pd.Series(scores)
     
     def calculate_value_scores(self, fundamentals: pd.DataFrame) -> pd.Series:
-        """Calculate value scores for stocks"""
+        """Calculate value scores for stocks, normalised relative to sector peers.
+
+        For each valuation metric (P/E, P/B, EV/EBITDA, P/S) the stock is scored
+        against the median of stocks in the same sector within the screened set.
+        If fewer than 3 peers share the same sector the absolute thresholds are used
+        as a fallback so thinly-represented sectors still receive meaningful scores.
+        """
         scores = {}
-        
+
+        # --- Pre-compute sector medians across the screened universe ---
+        METRICS = ['pe_ratio', 'pb_ratio', 'ev_ebitda', 'ps_ratio']
+        sector_col = 'sector' if 'sector' in fundamentals.columns else None
+        sector_medians: Dict[str, Dict[str, float]] = {}
+
+        if sector_col:
+            for sector, group in fundamentals.groupby(sector_col):
+                medians = {}
+                for m in METRICS:
+                    if m in group.columns:
+                        valid = group[m].dropna()
+                        valid = valid[valid > 0]
+                        if len(valid) >= 3:
+                            medians[m] = float(valid.median())
+                sector_medians[sector] = medians
+
+        def _relative_score(value: float, sector_median: float,
+                            low_mult: float, mid_mult: float, high_mult: float,
+                            pts_max: int, pts_mid: int, pts_low: int) -> int:
+            """Score a metric relative to its sector median.
+
+            Ratios < low_mult × median  → pts_max
+            Ratios < mid_mult × median  → pts_mid
+            Ratios < high_mult × median → pts_low
+            Else → 0
+            """
+            ratio = value / sector_median
+            if ratio < low_mult:
+                return pts_max
+            if ratio < mid_mult:
+                return pts_mid
+            if ratio < high_mult:
+                return pts_low
+            return 0
+
+        def _absolute_pe(v: float) -> int:
+            if v < 15: return 25
+            if v < 20: return 17
+            if v < 30: return 8
+            return 0
+
+        def _absolute_pb(v: float) -> int:
+            if v < 1.5: return 20
+            if v < 2.5: return 12
+            if v < 3.5: return 4
+            return 0
+
+        def _absolute_evebitda(v: float) -> int:
+            if v < 10: return 20
+            if v < 15: return 12
+            if v < 20: return 4
+            return 0
+
+        def _absolute_ps(v: float) -> int:
+            if v < 2: return 20
+            if v < 4: return 12
+            if v < 8: return 5
+            return 0
+
         for ticker, row in fundamentals.iterrows():
             try:
                 score = 0
-                
-                # P/E ratio scoring — lower is better (max 25 pts)
-                if pd.notna(row['pe_ratio']) and row['pe_ratio'] > 0:
-                    if row['pe_ratio'] < 15:
-                        score += 25
-                    elif row['pe_ratio'] < 20:
-                        score += 17
-                    elif row['pe_ratio'] < 30:
-                        score += 8
+                sector = row.get(sector_col, '') if sector_col else ''
+                s_med = sector_medians.get(sector, {})
 
-                # P/B ratio scoring (max 20 pts)
-                if pd.notna(row['pb_ratio']) and row['pb_ratio'] > 0:
-                    if row['pb_ratio'] < 1.5:
-                        score += 20
-                    elif row['pb_ratio'] < 2.5:
-                        score += 12
-                    elif row['pb_ratio'] < 3.5:
-                        score += 4
+                # P/E ratio — lower is better (max 25 pts)
+                pe = row.get('pe_ratio')
+                if pd.notna(pe) and pe > 0:
+                    med = s_med.get('pe_ratio')
+                    if med and med > 0:
+                        score += _relative_score(pe, med, 0.7, 0.9, 1.15, 25, 17, 8)
+                    else:
+                        score += _absolute_pe(pe)
 
-                # EV/EBITDA scoring (max 20 pts)
-                if pd.notna(row['ev_ebitda']) and row['ev_ebitda'] > 0:
-                    if row['ev_ebitda'] < 10:
-                        score += 20
-                    elif row['ev_ebitda'] < 15:
-                        score += 12
-                    elif row['ev_ebitda'] < 20:
-                        score += 4
+                # P/B ratio (max 20 pts)
+                pb = row.get('pb_ratio')
+                if pd.notna(pb) and pb > 0:
+                    med = s_med.get('pb_ratio')
+                    if med and med > 0:
+                        score += _relative_score(pb, med, 0.6, 0.85, 1.10, 20, 12, 4)
+                    else:
+                        score += _absolute_pb(pb)
 
-                # P/S ratio scoring — lower is better; useful for low-earnings firms (max 20 pts)
+                # EV/EBITDA (max 20 pts)
+                ev = row.get('ev_ebitda')
+                if pd.notna(ev) and ev > 0:
+                    med = s_med.get('ev_ebitda')
+                    if med and med > 0:
+                        score += _relative_score(ev, med, 0.7, 0.9, 1.15, 20, 12, 4)
+                    else:
+                        score += _absolute_evebitda(ev)
+
+                # P/S ratio — lower is better (max 20 pts)
                 ps = row.get('ps_ratio') if 'ps_ratio' in row.index else None
                 if ps is not None and pd.notna(ps) and ps > 0:
-                    if ps < 2:
-                        score += 20
-                    elif ps < 4:
-                        score += 12
-                    elif ps < 8:
-                        score += 5
+                    med = s_med.get('ps_ratio')
+                    if med and med > 0:
+                        score += _relative_score(ps, med, 0.7, 0.9, 1.20, 20, 12, 5)
+                    else:
+                        score += _absolute_ps(ps)
 
                 # Dividend yield bonus (max 15 pts)
-                if pd.notna(row['dividend_yield']) and row['dividend_yield'] > 0.02:
+                if pd.notna(row.get('dividend_yield')) and row['dividend_yield'] > 0.02:
                     score += 15
 
                 scores[ticker] = min(100, score)
-                
-            except Exception as e:
+
+            except Exception:
                 scores[ticker] = 0
-        
+
         return pd.Series(scores)
     
     def calculate_growth_scores(self, fundamentals: pd.DataFrame) -> pd.Series:
@@ -1555,16 +1748,38 @@ class DataService:
                     elif profit_margin > 5:
                         score += 5
 
-                # Simplified Piotroski F-Score signals (3 of 9 derivable from available data)
-                # Each point = company shows a positive quality signal
+                # Full Piotroski F-Score (9 signals, 3 pts each = max 27 bonus pts)
+                # Signals 1-3: derivable from standard fundamentals
+                # Signals 4-9: require 2-year income statement + cash flow data
                 piotroski = 0
+                # Signal 1: positive ROE (profitability proxy for ROA)
                 if pd.notna(row.get('roe')) and row['roe'] > 0:
-                    piotroski += 1  # positive profitability (ROA proxy)
+                    piotroski += 1
+                # Signal 2: low leverage (D/E < 1)
                 if pd.notna(row.get('debt_to_equity')) and row['debt_to_equity'] < 1.0:
-                    piotroski += 1  # low leverage
+                    piotroski += 1
+                # Signal 3: adequate liquidity (current ratio > 1)
                 if pd.notna(row.get('current_ratio')) and row['current_ratio'] > 1.0:
-                    piotroski += 1  # adequate liquidity
-                score += piotroski * 3  # max 9 bonus points
+                    piotroski += 1
+                # Signal 4: operating cash flow > 0
+                if row.get('pio_cfo_positive', False):
+                    piotroski += 1
+                # Signal 5: ROA improving year-over-year
+                if row.get('pio_roa_improving', False):
+                    piotroski += 1
+                # Signal 6: low accruals (CFO/assets > net income/assets)
+                if row.get('pio_low_accruals', False):
+                    piotroski += 1
+                # Signal 7: long-term leverage ratio falling
+                if row.get('pio_leverage_falling', False):
+                    piotroski += 1
+                # Signal 8: gross margin improving year-over-year
+                if row.get('pio_gross_margin_improving', False):
+                    piotroski += 1
+                # Signal 9: asset turnover improving year-over-year
+                if row.get('pio_asset_turnover_improving', False):
+                    piotroski += 1
+                score += piotroski * 3  # max 27 bonus pts; capped at 100 below
 
                 scores[ticker] = min(100, score)
 
@@ -1604,9 +1819,16 @@ class DataService:
                     elif row['payout_ratio'] < 0.2:  # Conservative
                         score += 10
                 
-                # Dividend growth proxy (based on revenue and earnings growth)
-                if pd.notna(row['revenue_growth']) and row['revenue_growth'] > 0.05:
-                    score += 20
+                # Dividend history (actual track record — replaces revenue-growth proxy)
+                div_consistent = row.get('dividend_consistent', False)
+                div_growing = row.get('dividend_growing', False)
+                if div_consistent:
+                    score += 10  # paid at least quarterly for 2 years
+                if div_growing:
+                    score += 10  # dividend amount grew year-over-year
+                elif not div_consistent and pd.notna(row.get('revenue_growth')) and row['revenue_growth'] > 0.05:
+                    # Fallback proxy for stocks without dividend history data
+                    score += 5
                 
                 scores[ticker] = min(100, score)
                 
